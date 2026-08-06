@@ -10,11 +10,18 @@ from streamlit_app import (
     LANGUAGES,
     build_translation_prompt,
     chunk_document,
+    chunk_text,
     clean_model_output,
+    count_tokens,
     docling_available,
+    heading_level,
+    liteparse_available,
     load_document,
+    load_document_markdown,
     render_output,
+    split_oversized,
     stream_translate,
+    token_overhead,
     tokenize_prompt,
     translate_document,
 )
@@ -483,6 +490,253 @@ def test_chunk_document_defaults_to_max_chunk_tokens(
     )
 
 
+# -- liteparse_available -------------------------------------------------------
+
+
+@patch("importlib.util.find_spec")
+def test_liteparse_available_true_when_spec_found(mock_find_spec: MagicMock) -> None:
+    mock_find_spec.return_value = object()
+    assert liteparse_available() is True
+
+
+@patch("importlib.util.find_spec")
+def test_liteparse_available_false_when_spec_missing(
+    mock_find_spec: MagicMock,
+) -> None:
+    mock_find_spec.return_value = None
+    assert liteparse_available() is False
+
+
+# -- load_document_markdown ----------------------------------------------------
+
+
+@patch("liteparse.LiteParse")
+def test_load_document_markdown_returns_parsed_text(
+    mock_liteparse_cls: MagicMock,
+) -> None:
+    mock_liteparse_cls.return_value.parse.return_value.text = "# Title\n\nBody."
+
+    assert load_document_markdown(b"pdf bytes") == "# Title\n\nBody."
+    mock_liteparse_cls.return_value.parse.assert_called_once_with(b"pdf bytes")
+
+
+@patch("liteparse.LiteParse")
+def test_load_document_markdown_requests_quiet_markdown_without_ocr(
+    mock_liteparse_cls: MagicMock,
+) -> None:
+    load_document_markdown(b"data")
+
+    kwargs = mock_liteparse_cls.call_args.kwargs
+    assert kwargs["output_format"] == "markdown"
+    # OCR off: born-digital PDFs already carry a text layer. quiet: LiteParse
+    # otherwise prints timing lines into Streamlit's stdout.
+    assert kwargs["ocr_enabled"] is False
+    assert kwargs["quiet"] is True
+
+
+# -- heading_level -------------------------------------------------------------
+
+
+def test_heading_level_reads_atx_depth() -> None:
+    assert heading_level("# Title") == 1
+    assert heading_level("### Section") == 3
+    assert heading_level("###### Deepest") == 6
+
+
+def test_heading_level_zero_for_non_headings() -> None:
+    assert heading_level("Just a paragraph.") == 0
+    assert heading_level("") == 0
+    # Seven hashes is past the ATX limit, and #tag has no space delimiter.
+    assert heading_level("####### Too deep") == 0
+    assert heading_level("#hashtag not a heading") == 0
+
+
+# -- chunk_text ----------------------------------------------------------------
+
+
+class FakeTokenizer:
+    """Whitespace tokenizer so chunk_text budgets are readable in tests."""
+
+    def encode(self, text: str) -> list[str]:
+        return text.split()
+
+    def decode(self, ids: list[str]) -> str:
+        return " ".join(ids)
+
+
+class SpecialTokenTokenizer:
+    """Whitespace tokenizer that mimics the model tokenizer's quirks.
+
+    The real tokenizer prepends a BOS token to every ``encode`` call and spends
+    a token on a blank line. Both make an assembled chunk cost more than the sum
+    of its blocks, which is what pushed chunks over budget before the packer
+    charged for separators and measured the finished chunk. ``decode`` leaves
+    the BOS visible so a leaked special token fails a test loudly.
+    """
+
+    def encode(self, text: str) -> list[str]:
+        tokens: list[str] = []
+        for i, part in enumerate(text.split("\n\n")):
+            if i:
+                tokens.append("\n\n")
+            tokens.extend(part.split())
+        return ["<bos>", *tokens]
+
+    def decode(self, ids: list[str]) -> str:
+        return " ".join(ids)
+
+
+def _tok_len(text: str) -> int:
+    return len(FakeTokenizer().encode(text))
+
+
+def test_chunk_text_returns_empty_for_blank_input() -> None:
+    assert chunk_text("", FakeTokenizer()) == []
+    assert chunk_text("   \n\n  \n", FakeTokenizer()) == []
+
+
+def test_chunk_text_keeps_every_chunk_within_budget() -> None:
+    text = "\n\n".join(
+        ["# Report", "alpha " * 20, "## Section", "beta " * 30, "gamma " * 25]
+    )
+    for budget in (10, 25, 60):
+        chunks = chunk_text(text, FakeTokenizer(), max_tokens=budget)
+        assert chunks, f"budget {budget} produced no chunks"
+        assert all(_tok_len(c) <= budget for c in chunks), f"over budget at {budget}"
+
+
+def test_chunk_text_packs_multiple_paragraphs_into_one_chunk() -> None:
+    # Three short paragraphs fit in one generous chunk; packing greedily keeps
+    # the chunk count (and so the per-chunk prompt overhead) down.
+    text = "one two three\n\nfour five six\n\nseven eight nine"
+
+    assert len(chunk_text(text, FakeTokenizer(), max_tokens=100)) == 1
+
+
+def test_chunk_text_does_not_split_a_paragraph_that_fits() -> None:
+    text = "alpha beta gamma\n\ndelta epsilon zeta"
+    chunks = chunk_text(text, FakeTokenizer(), max_tokens=3)
+
+    assert "alpha beta gamma" in chunks
+    assert "delta epsilon zeta" in chunks
+
+
+def test_chunk_text_prepends_enclosing_heading_context() -> None:
+    text = "# Report\n\n## Findings\n\n" + "word " * 30
+    chunks = chunk_text(text, FakeTokenizer(), max_tokens=20)
+
+    # The body chunk carries the headings it sits under, because each chunk is
+    # translated as an independent prompt with no memory of its neighbours.
+    body = [c for c in chunks if "word" in c]
+    assert body
+    assert all(c.startswith("# Report\n\n## Findings") for c in body)
+
+
+def test_chunk_text_does_not_duplicate_heading_it_opens_with() -> None:
+    text = "# Report\n\nbody text here"
+    chunks = chunk_text(text, FakeTokenizer(), max_tokens=100)
+
+    assert chunks[0].count("# Report") == 1
+
+
+def test_chunk_text_uses_enclosing_heading_not_the_following_one() -> None:
+    # Regression: the heading trail advances as blocks are read, so a chunk
+    # flushed after a later heading was seen must still carry the heading of
+    # the section it actually belongs to -- not the next section's.
+    text = "## First\n\naaa bbb ccc\n\n## Second\n\nddd eee fff"
+    chunks = chunk_text(text, FakeTokenizer(), max_tokens=6)
+
+    first = next(c for c in chunks if "aaa bbb ccc" in c)
+    assert "## First" in first
+    assert "## Second" not in first
+
+
+def test_chunk_text_deeper_heading_replaces_sibling_shallower_survives() -> None:
+    text = "# Book\n\n## Alpha\n\n## Beta\n\n" + "tail " * 20
+    chunks = chunk_text(text, FakeTokenizer(), max_tokens=12)
+
+    tail = next(c for c in chunks if "tail" in c)
+    assert "# Book" in tail
+    assert "## Beta" in tail
+    # Alpha was replaced by its sibling Beta, so it must not linger in context.
+    assert "## Alpha" not in tail
+
+
+def test_chunk_text_splits_oversized_paragraph_on_sentence_boundaries() -> None:
+    text = "First sentence here. Second sentence here. Third sentence here."
+    chunks = chunk_text(text, FakeTokenizer(), max_tokens=4)
+
+    assert len(chunks) > 1
+    # Sentences stay intact rather than being cut mid-clause.
+    assert all(c.strip().endswith(".") for c in chunks)
+
+
+def test_chunk_text_hard_splits_a_single_unpunctuated_run() -> None:
+    text = " ".join(f"w{i}" for i in range(20))
+    chunks = chunk_text(text, FakeTokenizer(), max_tokens=6)
+
+    assert len(chunks) > 1
+    assert all(_tok_len(c) <= 6 for c in chunks)
+    # No content is dropped on the hard-split path.
+    assert " ".join(chunks).split() == text.split()
+
+
+def test_chunk_text_respects_budget_when_tokenizer_adds_special_tokens() -> None:
+    # Regression: summing per-block counts charges one BOS per block and none of
+    # the separators, so chunks used to land over budget with a real tokenizer.
+    tok = SpecialTokenTokenizer()
+    overhead = len(tok.encode(""))
+    text = "\n\n".join(
+        ["# Report", "alpha " * 12, "## Section", "beta " * 18, "gamma " * 9]
+    )
+    for budget in (12, 20, 40, 80):
+        chunks = chunk_text(text, tok, max_tokens=budget)
+        assert chunks, f"budget {budget} produced no chunks"
+        for chunk in chunks:
+            size = len(tok.encode(chunk)) - overhead
+            assert size <= budget, f"{size} > {budget} for {chunk!r}"
+
+
+def test_chunk_text_does_not_leak_special_tokens_into_output() -> None:
+    # The hard-split path slices token ids, so it must drop the BOS prefix
+    # first or decode would write it back into the translated text.
+    tok = SpecialTokenTokenizer()
+    chunks = chunk_text(" ".join(f"w{i}" for i in range(40)), tok, max_tokens=5)
+
+    assert chunks
+    assert not any("<bos>" in c for c in chunks)
+
+
+# -- token_overhead / count_tokens ---------------------------------------------
+
+
+def test_token_overhead_counts_the_special_prefix() -> None:
+    assert token_overhead(SpecialTokenTokenizer()) == 1
+    assert token_overhead(FakeTokenizer()) == 0
+
+
+def test_count_tokens_excludes_the_special_prefix() -> None:
+    # Net length, so summing block counts doesn't charge a BOS per block.
+    assert count_tokens("one two three", SpecialTokenTokenizer()) == 3
+    assert count_tokens("", SpecialTokenTokenizer()) == 0
+
+
+# -- split_oversized -----------------------------------------------------------
+
+
+def test_split_oversized_keeps_whole_sentences_when_they_fit() -> None:
+    pieces = split_oversized("Alpha one. Beta two.", FakeTokenizer(), 3)
+
+    assert pieces == ["Alpha one.", "Beta two."]
+
+
+def test_split_oversized_handles_cjk_full_stops() -> None:
+    # The app translates across 67 languages, so CJK sentence enders count too.
+    pieces = split_oversized("第一文です。 第二文です。", FakeTokenizer(), 2)
+
+    assert pieces == ["第一文です。", "第二文です。"]
+
+
 # -- cached_document_chunks ----------------------------------------------------
 
 
@@ -531,13 +785,73 @@ def test_cached_document_chunks_forwards_custom_max_tokens(
     assert mock_chunk_document.call_args[0][2] == 1234
 
 
+@patch("streamlit_app.chunk_text")
+@patch("streamlit_app.load_document_markdown")
+@patch("streamlit_app.load_model")
+def test_cached_document_chunks_routes_liteparse_backend(
+    mock_load_model: MagicMock,
+    mock_load_markdown: MagicMock,
+    mock_chunk_text: MagicMock,
+) -> None:
+    cached = streamlit_app.cached_document_chunks
+    cached.clear()
+    tokenizer = MagicMock()
+    mock_load_model.return_value = (MagicMock(), tokenizer)
+    mock_load_markdown.return_value = "# Doc\n\nBody."
+    mock_chunk_text.return_value = ["chunk"]
+
+    result = cached(b"bytes", "report.pdf", streamlit_app.PARSER_LITEPARSE)
+
+    assert result == ["chunk"]
+    # LiteParse takes bytes only -- it sniffs the format itself, no filename.
+    mock_load_markdown.assert_called_once_with(b"bytes")
+    mock_chunk_text.assert_called_once_with(
+        "# Doc\n\nBody.", tokenizer, streamlit_app.MAX_CHUNK_TOKENS
+    )
+
+
+@patch("streamlit_app.chunk_text")
+@patch("streamlit_app.load_document_markdown")
+@patch("streamlit_app.chunk_document")
+@patch("streamlit_app.load_document")
+@patch("streamlit_app.load_model")
+def test_cached_document_chunks_backend_selects_one_path_only(
+    mock_load_model: MagicMock,
+    mock_load_document: MagicMock,
+    mock_chunk_document: MagicMock,
+    mock_load_markdown: MagicMock,
+    mock_chunk_text: MagicMock,
+) -> None:
+    cached = streamlit_app.cached_document_chunks
+    cached.clear()
+    mock_load_model.return_value = (MagicMock(), MagicMock())
+    mock_chunk_document.return_value = []
+
+    cached(b"bytes", "report.pdf", streamlit_app.PARSER_DOCLING)
+
+    # The Docling path must not touch LiteParse, so an uninstalled LiteParse
+    # can never break a Docling parse.
+    mock_load_document.assert_called_once()
+    mock_load_markdown.assert_not_called()
+    mock_chunk_text.assert_not_called()
+
+
+def test_cached_document_chunks_keys_on_backend() -> None:
+    # backend is part of the cache key: switching parsers on the same upload
+    # must re-parse rather than return the other backend's chunks.
+    source = "".join(_APP_SOURCE.split())
+    assert "defcached_document_chunks(file_bytes:bytes,filename:str,backend:str" in (
+        source
+    )
+
+
 def test_document_tab_calls_cache_wrapper() -> None:
     # AppTest can't drive st.file_uploader, so guard the wiring at the source
     # level: the Document tab must go through cached_document_chunks, not call
     # load_document/chunk_document directly (which would silently bypass the
     # parse+chunk cache). Strip whitespace so line-wrapping can't break the match.
     compact = "".join(_APP_SOURCE.split())
-    assert "cached_document_chunks(uploaded.getvalue(),uploaded.name)" in compact
+    assert "cached_document_chunks(uploaded.getvalue(),uploaded.name,parser)" in compact
 
 
 # -- translate_document --------------------------------------------------------

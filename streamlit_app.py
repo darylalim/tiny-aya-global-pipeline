@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+import re
 from collections.abc import Iterator
 from typing import Any
 
@@ -17,6 +18,15 @@ MAX_INPUT_TOKENS: int = 8192
 # room for the per-chunk prompt wrapper (instruction + chat template).
 MAX_CHUNK_TOKENS: int = 7000
 DOCUMENT_TYPES: list[str] = ["pdf", "docx", "pptx", "xlsx", "html"]
+
+# Document parser backends. Docling is model-based (accurate on hard layouts,
+# ~500 MB of weights, pulls in PyTorch); LiteParse is heuristic (one 11 MB
+# wheel, no weights, far faster) but ships no chunker -- see chunk_text.
+PARSER_DOCLING: str = "Docling"
+PARSER_LITEPARSE: str = "LiteParse"
+# LiteParse handles PDFs and images natively; Office formats need LibreOffice
+# on PATH and HTML is unsupported, so the uploader narrows to what always works.
+LITE_DOCUMENT_TYPES: list[str] = ["pdf", "png", "jpg", "jpeg", "tiff", "webp"]
 
 # Shared UI constants reused across the Text and Document tabs.
 PANEL_HEIGHT: int = 450
@@ -198,6 +208,158 @@ def chunk_document(
     return [chunker.contextualize(chunk=c) for c in chunker.chunk(doc)]
 
 
+# -- LiteParse document path (optional lite dependency) -----------------------
+# LiteParse parses to markdown but ships no chunker, so chunk_text below is the
+# token-aware packer that HybridChunker provides on the docling path.
+
+_BLANK_LINE_RE = re.compile(r"\n\s*\n")
+# Sentence boundaries for Latin punctuation plus CJK full stops, since the app
+# translates across all 67 languages.
+_SENTENCE_RE = re.compile(r"(?<=[.!?。！？])\s+")
+
+
+def liteparse_available() -> bool:
+    """Return True if the optional ``liteparse`` dependency is importable."""
+    import importlib.util
+
+    return importlib.util.find_spec("liteparse") is not None
+
+
+def load_document_markdown(file_bytes: bytes) -> str:
+    """Parse uploaded file bytes into a single markdown string via LiteParse."""
+    from liteparse import LiteParse
+
+    # ocr_enabled=False: born-digital PDFs carry a real text layer, and OCR on
+    # top of it is slower without changing the result. quiet=True keeps
+    # LiteParse's timing lines out of Streamlit's stdout.
+    parser = LiteParse(output_format="markdown", ocr_enabled=False, quiet=True)
+    return parser.parse(file_bytes).text
+
+
+def heading_level(block: str) -> int:
+    """Return the ATX markdown heading level of ``block``, or 0 if not a heading."""
+    marker = block.lstrip().split(" ", 1)[0]
+    return len(marker) if marker and set(marker) == {"#"} and len(marker) <= 6 else 0
+
+
+def token_overhead(tokenizer: Any) -> int:
+    """Count the special tokens ``encode`` prepends to every string.
+
+    The model's tokenizer adds a BOS token to each ``encode`` call, so summing
+    per-block counts would charge one BOS per block for a chunk that only ever
+    carries one. Measuring the constant lets the packer work in net tokens.
+    """
+    return len(tokenizer.encode(""))
+
+
+def count_tokens(text: str, tokenizer: Any) -> int:
+    """Return the token length of ``text``, excluding the special-token prefix."""
+    return len(tokenizer.encode(text)) - token_overhead(tokenizer)
+
+
+def split_oversized(block: str, tokenizer: Any, max_tokens: int) -> list[str]:
+    """Split a single over-budget block into pieces that each fit ``max_tokens``."""
+    pieces: list[str] = []
+    overhead = token_overhead(tokenizer)
+    for sentence in _SENTENCE_RE.split(block):
+        if not sentence:
+            continue
+        if count_tokens(sentence, tokenizer) <= max_tokens:
+            pieces.append(sentence)
+            continue
+        # A single sentence over budget (unpunctuated wall of text, or a table
+        # dumped as one block): fall back to hard token windows. Drop the BOS
+        # prefix first, or it would be decoded back into the chunk as text.
+        ids = tokenizer.encode(sentence)[overhead:]
+        pieces.extend(
+            tokenizer.decode(ids[i : i + max_tokens])
+            for i in range(0, len(ids), max_tokens)
+        )
+    return pieces
+
+
+def chunk_text(
+    text: str, tokenizer: Any, max_tokens: int = MAX_CHUNK_TOKENS
+) -> list[str]:
+    """Pack markdown paragraphs into chunks that stay under ``max_tokens``.
+
+    The token-aware counterpart to ``chunk_document`` for the LiteParse path.
+    Blocks are packed greedily so each chunk carries as much as it can hold,
+    paragraphs are never split unless one alone exceeds the budget, and the
+    enclosing markdown headings are prepended to chunks that do not already
+    open with them -- the same context that ``HybridChunker.contextualize``
+    supplies, and which matters here because every chunk is translated as an
+    independent prompt with no memory of its neighbours.
+    """
+    blocks = [b.strip() for b in _BLANK_LINE_RE.split(text) if b.strip()]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
+    # Blocks are joined with a blank line, so every join after the first costs
+    # a separator. Charging it keeps the running total honest instead of
+    # drifting over budget by one token per block.
+    separator = count_tokens("\n\n", tokenizer)
+    # ``trail`` advances as blocks are read; ``pending`` is the snapshot taken
+    # when the open chunk started. They differ once a heading is read into a
+    # chunk that is still filling, and prepending ``trail`` at that point would
+    # label a chunk with the heading of the section that comes *after* it.
+    trail: dict[int, str] = {}
+    trail_tokens = 0
+    pending: dict[int, str] = {}
+    pending_tokens = 0
+
+    def flush() -> None:
+        nonlocal current, current_tokens, pending, pending_tokens
+        if not current:
+            return
+        # Skip any heading the chunk already opens with, so context is not
+        # duplicated at the top of the chunk.
+        context = [pending[lv] for lv in sorted(pending) if pending[lv] != current[0]]
+        body = "\n\n".join([*context, *current])
+        # Packing sums per-block counts, but a tokenizer merges across block
+        # boundaries, so the assembled chunk can run a little over. Measure the
+        # real thing and split it if the estimate drifted past the budget.
+        if count_tokens(body, tokenizer) > max_tokens:
+            chunks.extend(split_oversized(body, tokenizer, max_tokens))
+        else:
+            chunks.append(body)
+        current = []
+        current_tokens = 0
+        pending = {}
+        pending_tokens = 0
+
+    for block in blocks:
+        # Reserve room for whichever context is larger: the one already
+        # committed to the open chunk, or the one a chunk opening now would
+        # take. Either is possible depending on where this block lands.
+        budget = max(max_tokens - max(trail_tokens, pending_tokens), 1)
+        n = count_tokens(block, tokenizer)
+        pieces = [block] if n <= budget else split_oversized(block, tokenizer, budget)
+        for piece in pieces:
+            size = n if piece is block else count_tokens(piece, tokenizer)
+            if current:
+                size += separator
+            if current and current_tokens + size > budget:
+                flush()
+                size -= separator
+            if not current:
+                pending, pending_tokens = dict(trail), trail_tokens
+            current.append(piece)
+            current_tokens += size
+
+        if level := heading_level(block):
+            # A deeper heading replaces its siblings; shallower ones survive.
+            trail = {lv: h for lv, h in trail.items() if lv < level}
+            trail[level] = block
+            # Each context heading is followed by a separator when rendered.
+            trail_tokens = sum(
+                count_tokens(h, tokenizer) + separator for h in trail.values()
+            )
+
+    flush()
+    return chunks
+
+
 def translate_document(
     chunks: list[str],
     source_lang: str,
@@ -240,16 +402,23 @@ def load_model() -> tuple[Any, Any]:
 
 @st.cache_data(max_entries=8, show_spinner=False)
 def cached_document_chunks(
-    file_bytes: bytes, filename: str, max_tokens: int = MAX_CHUNK_TOKENS
+    file_bytes: bytes,
+    filename: str,
+    backend: str = PARSER_DOCLING,
+    max_tokens: int = MAX_CHUNK_TOKENS,
 ) -> list[str]:
-    """Parse + chunk an uploaded document, cached by file bytes and filename.
+    """Parse + chunk an uploaded document, cached by file bytes, name and backend.
 
     Re-translating the same upload (e.g. into another language) then skips the
-    expensive Docling convert + chunk. The tokenizer is fetched from the cached
-    ``load_model()`` rather than taken as an argument, since it is unhashable and
-    would defeat ``@st.cache_data``'s argument hashing.
+    expensive parse + chunk. ``backend`` is part of the cache key so switching
+    parsers re-parses instead of returning the other backend's chunks. The
+    tokenizer is fetched from the cached ``load_model()`` rather than taken as an
+    argument, since it is unhashable and would defeat ``@st.cache_data``'s
+    argument hashing.
     """
     _, tokenizer = load_model()
+    if backend == PARSER_LITEPARSE:
+        return chunk_text(load_document_markdown(file_bytes), tokenizer, max_tokens)
     doc = load_document(file_bytes, filename)
     return chunk_document(doc, tokenizer, max_tokens)
 
@@ -434,13 +603,40 @@ with text_tab:
                     st.rerun()
 
 with doc_tab:
-    if not docling_available():
+    parsers = [
+        name
+        for name, installed in (
+            (PARSER_DOCLING, docling_available()),
+            (PARSER_LITEPARSE, liteparse_available()),
+        )
+        if installed
+    ]
+    if not parsers:
         st.info(
-            "Document translation needs the optional `docling` package. "
-            "Install it with `uv sync --extra docs`.",
+            "Document translation needs a parser: `uv sync --extra docs` for "
+            "Docling, or `uv sync --extra lite` for LiteParse.",
             icon=":material/download:",
         )
     else:
+        # -- Parser backend ---------------------------------------------------
+
+        # Seeded here rather than with the other setdefault() calls because the
+        # valid options depend on which extras are installed; this also resets a
+        # stored choice whose backend has since been uninstalled.
+        if st.session_state.get("doc_parser") not in parsers:
+            st.session_state.doc_parser = parsers[0]
+        st.radio(
+            "Parser",
+            parsers,
+            key="doc_parser",
+            horizontal=True,
+            help=(
+                "Docling: model-based, better on dense tables and scans. "
+                "LiteParse: heuristic, no model weights, much faster to start."
+            ),
+        )
+        parser = st.session_state.doc_parser
+
         # -- Language bar -----------------------------------------------------
 
         with st.container(border=True):
@@ -464,7 +660,9 @@ with doc_tab:
 
         uploaded = st.file_uploader(
             "Upload a document",
-            type=DOCUMENT_TYPES,
+            type=(
+                LITE_DOCUMENT_TYPES if parser == PARSER_LITEPARSE else DOCUMENT_TYPES
+            ),
             label_visibility="collapsed",
         )
         translate_doc_clicked = st.button(
@@ -490,9 +688,9 @@ with doc_tab:
             else:
                 result = ""
                 try:
-                    with st.spinner("Reading document..."):
+                    with st.spinner(f"Reading document with {parser}..."):
                         chunks = cached_document_chunks(
-                            uploaded.getvalue(), uploaded.name
+                            uploaded.getvalue(), uploaded.name, parser
                         )
                     if not chunks:
                         doc_warning_slot.warning(

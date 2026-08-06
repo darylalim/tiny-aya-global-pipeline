@@ -18,6 +18,9 @@ Repository = "https://github.com/darylalim/tiny-aya-translate"
 docs = [
     "docling>=2.103.0",
 ]
+lite = [
+    "liteparse>=0.1.0",
+]
 
 [dependency-groups]
 dev = [

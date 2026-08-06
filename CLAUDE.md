@@ -19,7 +19,8 @@ Streamlit application for translation using Cohere Labs Tiny Aya Global on Apple
 ## Commands
 
 ```bash
-uv sync --extra docs                                         # install optional document support
+uv sync --extra docs                                         # install optional document support (Docling)
+uv sync --extra lite                                         # install optional document support (LiteParse)
 uv run streamlit run streamlit_app.py                        # run the app
 uv run pytest test_streamlit_app.py test_streamlit_ui.py -v  # run tests
 uv run ruff check --fix .                                    # lint
@@ -68,6 +69,13 @@ When working with Python, invoke the relevant `/astral:<skill>` for uv, ty, and 
 - The UI is split into `st.tabs([":material/text_fields: Text", ":material/description: Document"])`: the Text tab is the original side-by-side flow; the Document tab translates uploaded files
 - Document functions (`docling_available`, `load_document`, `chunk_document`, `translate_document`) are pure functions with deferred `docling` imports; `docling` is an optional `docs` extra, and the Document tab shows an install hint when `docling_available()` is `False`
 - `chunk_document` runs Docling's `HybridChunker`; the token budget lives on a `HuggingFaceTokenizer` (the chunker takes no `max_tokens`), and mlx-lm's `TokenizerWrapper` is unwrapped via `._tokenizer` to reach the raw HF tokenizer
+- The Document tab has **two** parser backends, chosen by the `doc_parser` radio and named by the `PARSER_DOCLING` / `PARSER_LITEPARSE` constants. Docling (`docs` extra) is model-based: ~278 packages incl. PyTorch, ~500 MB of weights, ~5.7 s cold parse. LiteParse (`lite` extra) is heuristic: one 11 MB wheel with no transitive deps, no weights, ~0.08 s cold parse. The radio lists only backends whose package imports, and the tab shows the install hint only when neither is present
+- `doc_parser` is seeded with an `if ... not in parsers` guard rather than `setdefault`, because the valid options depend on which extras are installed; the guard also resets a stored choice whose backend was later uninstalled
+- LiteParse ships **no chunker**, so `chunk_text` is the token-aware packer that replaces `HybridChunker` on that path: it splits on blank lines, packs blocks greedily under the budget, splits over-budget blocks on sentence boundaries (Latin *and* CJK enders) and finally on hard token windows, and prepends the enclosing markdown heading trail — the `contextualize` equivalent, which matters because each chunk is translated as an independent prompt
+- `chunk_text` accounting has three traps, all covered by tests: the tokenizer prepends a BOS to **every** `encode` call (so `count_tokens` subtracts `token_overhead`, or an N-block chunk is charged N BOS tokens), joining blocks costs a `\n\n` separator each, and BPE still merges across block boundaries — so `flush()` measures the assembled chunk and splits it if the estimate drifted over. Drift measures ~1 token per block, far inside the `MAX_CHUNK_TOKENS`/`MAX_INPUT_TOKENS` headroom
+- The heading trail is snapshotted when a chunk *opens* (`pending`), not read at flush time — `trail` advances as blocks are consumed, so flushing against it labels a chunk with the heading of the section that comes *after* it
+- `cached_document_chunks` takes `backend` as its third argument so it is part of `@st.cache_data`'s key; switching parsers on the same upload re-parses instead of returning the other backend's chunks
+- LiteParse handles PDFs and images natively but needs LibreOffice for Office formats and cannot read HTML, so the uploader narrows to `LITE_DOCUMENT_TYPES` on that backend
 - `cached_document_chunks` (defined after `load_model`, decorated `@st.cache_data(max_entries=8, show_spinner=False)`) wraps `load_document` + `chunk_document` so re-translating the same upload skips the Docling convert+chunk; it fetches the tokenizer from `load_model()` internally rather than taking it as an arg (the tokenizer is unhashable and would defeat `@st.cache_data`'s key hashing). The Document tab calls this wrapper, not the pure functions directly; the pure functions stay for unit tests
 - `translate_document` reuses `tokenize_prompt` + `stream_translate` per chunk and yields `(chunk_index, cumulative_text)` on every token; chunks join with `\n\n`
 - `MAX_CHUNK_TOKENS` (7000) sits below `MAX_INPUT_TOKENS` to leave room for the per-chunk prompt wrapper (instruction + chat template); `translate_document` still re-checks each chunk and emits a `[Section skipped]` marker for any prompt over `MAX_INPUT_TOKENS`
