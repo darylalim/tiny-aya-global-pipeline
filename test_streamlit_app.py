@@ -8,10 +8,12 @@ from unittest.mock import MagicMock, patch
 import streamlit_app
 from streamlit_app import (
     LANGUAGES,
+    OCR_LANGUAGES,
     build_translation_prompt,
     chunk_text,
     clean_model_output,
     count_tokens,
+    hard_windows,
     heading_level,
     heading_line,
     is_blank_markdown,
@@ -475,6 +477,38 @@ def test_load_document_markdown_blanks_an_empty_fence(
     assert load_document_markdown(b"data") == ""
 
 
+@patch("liteparse.LiteParse")
+def test_load_document_markdown_ocrs_in_the_source_language(
+    mock_liteparse_cls: MagicMock,
+) -> None:
+    # Regression: OCR always ran as English, so a Cyrillic or CJK scan came
+    # back as plausible-looking Latin garbage with words silently dropped --
+    # non-empty, so it passed the "no translatable text" guard.
+    mock_liteparse_cls.return_value.parse.return_value.text = "Body."
+    load_document_markdown(b"\x89PNG\r\n\x1a\n data", "Russian")
+
+    assert mock_liteparse_cls.call_args.kwargs["ocr_language"] == "rus"
+
+
+@patch("liteparse.LiteParse")
+def test_load_document_markdown_falls_back_to_english_ocr(
+    mock_liteparse_cls: MagicMock,
+) -> None:
+    # Tesseract publishes no traineddata for Zulu, so asking for it would
+    # request a file that does not exist.
+    mock_liteparse_cls.return_value.parse.return_value.text = "Body."
+    load_document_markdown(b"\x89PNG\r\n\x1a\n data", "Zulu")
+
+    assert mock_liteparse_cls.call_args.kwargs["ocr_language"] == "eng"
+
+
+def test_ocr_languages_are_all_real_app_languages() -> None:
+    # A typo here silently downgrades a language to English OCR.
+    assert set(OCR_LANGUAGES) <= set(LANGUAGES)
+    assert OCR_LANGUAGES["Japanese"] == "jpn"
+    assert OCR_LANGUAGES["Chinese"] == "chi_sim"
+
+
 def test_is_blank_markdown_keeps_real_fenced_content() -> None:
     assert is_blank_markdown("```text\n\n```")
     assert is_blank_markdown("   \n\n  ")
@@ -745,6 +779,63 @@ def test_chunk_text_drift_repack_keeps_blocks_separated() -> None:
     assert all(c.count("\n\n") == c.count("Sentence") - 1 for c in chunks)
 
 
+class ByteFallbackTokenizer:
+    """Whitespace-free tokenizer that falls back to UTF-8 bytes for non-ASCII.
+
+    A real BPE tokenizer spends several tokens on a single character in scripts
+    outside its vocabulary, so slicing ids at a fixed stride can cut a character
+    in half. ``decode`` reassembles the bytes and, like a real tokenizer, yields
+    U+FFFD wherever a sequence was cut -- which is what makes the corruption
+    visible to a test. The plain fakes round-trip perfectly and cannot see it.
+    """
+
+    def encode(self, text: str) -> list[str]:
+        tokens: list[str] = ["<bos>"]
+        for char in text:
+            if char.isascii():
+                tokens.append(char)
+            else:
+                tokens.extend(f"<{byte}>" for byte in char.encode("utf-8"))
+        return tokens
+
+    def decode(self, ids: list[str]) -> str:
+        out = bytearray()
+        for token in ids:
+            if token.startswith("<") and token.endswith(">") and token[1:-1].isdigit():
+                out.append(int(token[1:-1]))
+            else:
+                out.extend(token.encode("utf-8"))
+        return out.decode("utf-8", errors="replace")
+
+
+def test_hard_windows_do_not_cut_multibyte_characters() -> None:
+    # Regression: a fixed token stride cut characters in half in byte-fallback
+    # scripts -- Thai, Lao, Khmer, Burmese and Amharic are all in LANGUAGES.
+    # The halves decoded to U+FFFD and the character was lost outright, and
+    # that corrupted text was what reached the model as source.
+    tok = ByteFallbackTokenizer()
+    text = "ประเทศไทย" * 6
+
+    for budget in range(3, 20):
+        joined = "".join(hard_windows(text, tok, budget))
+        assert "�" not in joined, f"character cut in half at budget {budget}"
+        assert joined == text, f"content changed at budget {budget}"
+
+
+def test_chunk_text_preserves_byte_fallback_scripts() -> None:
+    tok = ByteFallbackTokenizer()
+    text = "ประเทศไทยตั้งอยู่ในภูมิภาคเอเชีย " * 12
+
+    for budget in (24, 48, 96):
+        joined = "".join(chunk_text(text, tok, max_tokens=budget))
+        assert "�" not in joined, f"corrupted at budget {budget}"
+        # Chunks are stripped, so the space at a chunk boundary is gone;
+        # compare the content itself rather than the word split.
+        assert joined.replace(" ", "") == text.replace(" ", ""), (
+            f"content lost at budget {budget}"
+        )
+
+
 def test_chunk_text_labels_every_piece_when_the_trail_is_still_empty() -> None:
     # Regression: the first chunk opens before any heading has reached the
     # trail, so its headings live in its own blocks. Pieces cut out of its
@@ -866,13 +957,14 @@ def test_cached_document_chunks_composes_parse_and_chunk(
     mock_load_markdown.return_value = "# Doc\n\nBody."
     mock_chunk_text.return_value = ["chunk a", "chunk b"]
 
-    result = cached(b"bytes")
+    result = cached(b"bytes", "Thai")
 
     # Pulls the tokenizer from load_model() rather than taking it as an arg,
     # then composes load_document_markdown -> chunk_text. LiteParse sniffs the
-    # format itself, so no filename is threaded through.
+    # format itself, so no filename is threaded through -- but the source
+    # language is, since it selects the OCR language for image uploads.
     assert result == ["chunk a", "chunk b"]
-    mock_load_markdown.assert_called_once_with(b"bytes")
+    mock_load_markdown.assert_called_once_with(b"bytes", "Thai")
     mock_chunk_text.assert_called_once_with(
         "# Doc\n\nBody.", tokenizer, streamlit_app.MAX_CHUNK_TOKENS
     )
@@ -902,7 +994,10 @@ def test_document_tab_calls_cache_wrapper() -> None:
     # load_document_markdown/chunk_text directly (which would silently bypass
     # the parse+chunk cache). Strip whitespace so wrapping can't break the match.
     compact = "".join(_APP_SOURCE.split())
-    assert "cached_document_chunks(uploaded.getvalue())" in compact
+    assert (
+        "cached_document_chunks(uploaded.getvalue(),st.session_state.doc_source_lang)"
+        in compact
+    )
 
 
 # -- translate_document --------------------------------------------------------

@@ -105,6 +105,79 @@ LANGUAGES: list[str] = [
 ]
 
 
+# Tesseract language codes, keyed by the LANGUAGES entry the user picks as the
+# document's source. OCR defaults to English, so a Cyrillic, CJK or Arabic scan
+# came back as plausible-looking Latin garbage with words silently dropped --
+# non-empty, so it sailed past the "no translatable text" guard.
+#
+# Only languages Tesseract publishes traineddata for are listed. Hausa, Igbo,
+# Malagasy, Shona, Wolof, Xhosa and Zulu have none, so they fall back to
+# English rather than asking for a file that does not exist. Each language's
+# data is a separate ~12-15 MB download on first use.
+OCR_LANGUAGES: dict[str, str] = {
+    "English": "eng",
+    "Dutch": "nld",
+    "French": "fra",
+    "Italian": "ita",
+    "Portuguese": "por",
+    "Romanian": "ron",
+    "Spanish": "spa",
+    "Czech": "ces",
+    "Polish": "pol",
+    "Ukrainian": "ukr",
+    "Russian": "rus",
+    "Greek": "ell",
+    "German": "deu",
+    "Danish": "dan",
+    "Swedish": "swe",
+    "Bokmål": "nor",
+    "Catalan": "cat",
+    "Galician": "glg",
+    "Welsh": "cym",
+    "Irish": "gle",
+    "Basque": "eus",
+    "Croatian": "hrv",
+    "Latvian": "lav",
+    "Lithuanian": "lit",
+    "Slovak": "slk",
+    "Slovenian": "slv",
+    "Estonian": "est",
+    "Finnish": "fin",
+    "Hungarian": "hun",
+    "Serbian": "srp",
+    "Bulgarian": "bul",
+    "Arabic": "ara",
+    "Persian": "fas",
+    "Turkish": "tur",
+    "Maltese": "mlt",
+    "Hebrew": "heb",
+    "Hindi": "hin",
+    "Marathi": "mar",
+    "Bengali": "ben",
+    "Gujarati": "guj",
+    "Punjabi": "pan",
+    "Tamil": "tam",
+    "Telugu": "tel",
+    "Nepali": "nep",
+    "Urdu": "urd",
+    "Tagalog": "fil",
+    "Malay": "msa",
+    "Indonesian": "ind",
+    "Vietnamese": "vie",
+    "Javanese": "jav",
+    "Khmer": "khm",
+    "Thai": "tha",
+    "Lao": "lao",
+    "Chinese": "chi_sim",
+    "Burmese": "mya",
+    "Japanese": "jpn",
+    "Korean": "kor",
+    "Amharic": "amh",
+    "Yoruba": "yor",
+    "Swahili": "swa",
+}
+
+
 # -- Pure functions -----------------------------------------------------------
 
 
@@ -175,6 +248,9 @@ _BLANK_LINE_RE = re.compile(r"\n\s*\n")
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])\s*")
 # Fence markers, stripped when deciding whether a parse found any real text.
 _FENCE_RE = re.compile(r"```[a-zA-Z]*")
+# Most tokens a single character can cost under byte fallback: UTF-8 runs to
+# four bytes, and a byte-fallback tokenizer spends one token per byte.
+_MAX_CHAR_TOKENS = 4
 
 
 def is_blank_markdown(text: str) -> bool:
@@ -187,10 +263,12 @@ def is_blank_markdown(text: str) -> bool:
     return not _FENCE_RE.sub("", text).strip()
 
 
-def load_document_markdown(file_bytes: bytes) -> str:
+def load_document_markdown(file_bytes: bytes, source_lang: str = "English") -> str:
     """Parse uploaded file bytes into a single markdown string via LiteParse.
 
-    Returns ``""`` when the file yielded no readable text.
+    ``source_lang`` selects the OCR language for image uploads; it is ignored
+    for PDFs, which never run OCR. Returns ``""`` when the file yielded no
+    readable text.
     """
     from liteparse import LiteParse
 
@@ -208,6 +286,7 @@ def load_document_markdown(file_bytes: bytes) -> str:
         output_format="markdown",
         quiet=True,
         ocr_enabled=not file_bytes.lstrip()[:4].startswith(b"%PDF"),
+        ocr_language=OCR_LANGUAGES.get(source_lang, "eng"),
         ocr_failure_fatal=False,
     )
     text = parser.parse(file_bytes).text
@@ -265,17 +344,34 @@ def sentence_units(text: str) -> list[str]:
 
 
 def hard_windows(text: str, tokenizer: Any, max_tokens: int) -> list[str]:
-    """Cut ``text`` into fixed token windows -- the last resort when nothing
-    smaller fits.
+    """Cut ``text`` into token windows -- the last resort when nothing else fits.
 
     Strips the BOS prefix before slicing, or ``decode`` would write the special
     token back into the chunk as visible text.
+
+    Boundaries are pulled back until the window decodes cleanly. A byte-fallback
+    tokenizer spends several tokens on one character in scripts outside its
+    vocabulary -- Thai, Lao, Khmer, Burmese, Amharic and rarer CJK, all of them
+    in LANGUAGES -- so a fixed stride can cut a character in half. The halves
+    decode to U+FFFD and the character is lost outright, and the corrupted text
+    is what would then be sent to the model as source.
     """
     ids = tokenizer.encode(text)[token_overhead(tokenizer) :]
-    return [
-        tokenizer.decode(ids[i : i + max_tokens])
-        for i in range(0, len(ids), max_tokens)
-    ]
+    windows: list[str] = []
+    start = 0
+    while start < len(ids):
+        end = min(start + max_tokens, len(ids))
+        piece = tokenizer.decode(ids[start:end])
+        # Give back at most a character's worth of tokens: past that the
+        # replacement character is in the source itself, not an artefact of
+        # the cut, and shrinking further would only strand tokens.
+        floor = max(start + 1, end - _MAX_CHAR_TOKENS)
+        while end > floor and "�" in piece:
+            end -= 1
+            piece = tokenizer.decode(ids[start:end])
+        windows.append(piece)
+        start = end
+    return windows
 
 
 def pack_by_estimate(
@@ -556,18 +652,24 @@ def load_model() -> tuple[Any, Any]:
 
 @st.cache_data(max_entries=8, show_spinner=False)
 def cached_document_chunks(
-    file_bytes: bytes, max_tokens: int = MAX_CHUNK_TOKENS
+    file_bytes: bytes,
+    source_lang: str = "English",
+    max_tokens: int = MAX_CHUNK_TOKENS,
 ) -> list[str]:
-    """Parse + chunk an uploaded document, cached by file bytes.
+    """Parse + chunk an uploaded document, cached by file bytes and source
+    language.
 
-    Re-translating the same upload (e.g. into another language) then skips the
-    parse + chunk. The bytes are the whole key: LiteParse sniffs the format
-    itself, so the filename never reaches the parser. The tokenizer is fetched
-    from the cached ``load_model()`` rather than taken as an argument, since it
-    is unhashable and would defeat ``@st.cache_data``'s argument hashing.
+    Re-translating the same upload into another *target* language then skips
+    the parse + chunk. The source language is part of the key because it picks
+    the OCR language, so it changes the parsed text. LiteParse sniffs the
+    format itself, so the filename never reaches the parser. The tokenizer is
+    fetched from the cached ``load_model()`` rather than taken as an argument,
+    since it is unhashable and would defeat ``@st.cache_data``'s argument
+    hashing.
     """
     _, tokenizer = load_model()
-    return chunk_text(load_document_markdown(file_bytes), tokenizer, max_tokens)
+    markdown = load_document_markdown(file_bytes, source_lang)
+    return chunk_text(markdown, tokenizer, max_tokens)
 
 
 def render_output(placeholder: Any, text: str) -> None:
@@ -800,7 +902,9 @@ with doc_tab:
             result = ""
             try:
                 with st.spinner("Reading document..."):
-                    chunks = cached_document_chunks(uploaded.getvalue())
+                    chunks = cached_document_chunks(
+                        uploaded.getvalue(), st.session_state.doc_source_lang
+                    )
                 if not chunks:
                     doc_warning_slot.warning(
                         "No translatable text found in the document."
