@@ -356,6 +356,8 @@ def hard_windows(text: str, tokenizer: Any, max_tokens: int) -> list[str]:
     decode to U+FFFD and the character is lost outright, and the corrupted text
     is what would then be sent to the model as source.
     """
+    # A window of zero tokens would never advance past its own start.
+    max_tokens = max(max_tokens, 1)
     ids = tokenizer.encode(text)[token_overhead(tokenizer) :]
     windows: list[str] = []
     start = 0
@@ -537,6 +539,8 @@ def chunk_text(
     every chunk is translated as an independent prompt with no memory of its
     neighbours.
     """
+    # A non-positive budget would divide the document by zero-width windows.
+    max_tokens = max(max_tokens, 1)
     blocks = [b.strip() for b in _BLANK_LINE_RE.split(text) if b.strip()]
     chunks: list[str] = []
     current: list[str] = []
@@ -578,11 +582,22 @@ def chunk_text(
         pending = {}
         pending_tokens = 0
 
+    in_fence = False
     for block in blocks:
         # Reserve room for whichever context is larger: the one already
         # committed to the open chunk, or the one a chunk opening now would
         # take. Either is possible depending on where this block lands.
-        budget = max(max_tokens - max(trail_tokens, pending_tokens), 1)
+        room = max_tokens - max(trail_tokens, pending_tokens)
+        if room < max_tokens // 4:
+            # The heading trail is eating the budget. Clamping to a token
+            # instead shreds the document: a trail of 7,002 tokens against a
+            # 7,000 budget turned 13,121 tokens of markdown into 12,082 chunks
+            # and 292 seconds of packing. A chunk carrying less context still
+            # translates; a chunk of one token does not.
+            trail, trail_tokens = {}, 0
+            pending, pending_tokens = {}, 0
+            room = max_tokens
+        budget = max(room, 1)
         n = count_tokens(block, tokenizer)
         pieces = [block] if n <= budget else split_oversized(block, tokenizer, budget)
         for piece in pieces:
@@ -597,7 +612,12 @@ def chunk_text(
             current.append(piece)
             current_tokens += size
 
-        if level := heading_level(block):
+        # A '#' line inside a fenced code block is a shell comment, not a
+        # heading. Blocks split on blank lines, so a fence containing one
+        # arrives as several blocks and the marker count has to be carried
+        # across them -- otherwise the comment evicts the real heading and
+        # every chunk below it is labelled with a line of shell.
+        if not in_fence and (level := heading_level(block)):
             # A deeper heading replaces its siblings; shallower ones survive.
             trail = {lv: h for lv, h in trail.items() if lv < level}
             trail[level] = heading_line(block)
@@ -605,6 +625,7 @@ def chunk_text(
             trail_tokens = sum(
                 count_tokens(h, tokenizer) + separator for h in trail.values()
             )
+        in_fence ^= block.count("```") % 2 == 1
 
     flush()
     return chunks

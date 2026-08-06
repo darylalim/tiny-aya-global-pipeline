@@ -870,6 +870,58 @@ def test_pack_by_estimate_charges_the_join_cost() -> None:
     assert len(pack_by_estimate(units, tok, 6, join_cost=1)) == 5
 
 
+def test_chunk_text_drops_context_rather_than_shredding_the_document() -> None:
+    # Regression: budget = max(max_tokens - trail, 1) collapsed to one token
+    # once the heading trail reached the budget, so the packer emitted roughly
+    # a chunk per token -- 13,121 tokens of markdown became 12,082 chunks.
+    # Giving up the context is the lesser loss.
+    tok = FakeTokenizer()
+    heading = "# " + "Section " * 40  # far larger than the budget below
+    text = heading + "\n\n" + "\n\n".join(f"para {i} body text" for i in range(20))
+
+    chunks = chunk_text(text, tok, max_tokens=20)
+
+    assert len(chunks) < 20, f"document was shredded into {len(chunks)} chunks"
+    assert all(_tok_len(c) <= 20 for c in chunks)
+
+
+def test_chunk_text_accepts_a_non_positive_budget() -> None:
+    # max_tokens reaches this from cached_document_chunks, and a zero budget
+    # used to raise ValueError from range()'s zero step.
+    assert chunk_text("alpha beta", FakeTokenizer(), max_tokens=0)
+
+
+def test_chunk_text_ignores_headings_inside_a_code_fence() -> None:
+    # Regression: _BLANK_LINE_RE splits a fence at its internal blank line, so
+    # a '#' comment inside one read as an H1 and evicted the real heading --
+    # every chunk below was then labelled with a line of shell.
+    tok = FakeTokenizer()
+    text = (
+        "# Install\n\n```bash\nmake all\n\n# clean up the build tree\n"
+        "make clean\n```\n\n" + "\n\n".join(f"step {i} here" for i in range(12))
+    )
+
+    chunks = chunk_text(text, tok, max_tokens=12)
+
+    tail = next(c for c in chunks if "step 11" in c)
+    assert "# Install" in tail
+    assert "# clean up the build tree" not in tail
+
+
+def test_chunk_text_resumes_headings_after_a_closed_fence() -> None:
+    # The fence flag must clear again, or every heading after the first code
+    # block would be ignored.
+    tok = FakeTokenizer()
+    text = "# One\n\n```\ncode\n```\n\n## Two\n\n" + "\n\n".join(
+        f"body {i}" for i in range(10)
+    )
+
+    chunks = chunk_text(text, tok, max_tokens=10)
+
+    tail = next(c for c in chunks if "body 9" in c)
+    assert "## Two" in tail
+
+
 def test_chunk_text_does_not_leak_special_tokens_into_output() -> None:
     # The hard-split path slices token ids, so it must drop the BOS prefix
     # first or decode would write it back into the translated text.
