@@ -36,11 +36,15 @@ When working with Python, invoke the relevant `/astral:<skill>` for uv, ty, and 
 
 ## Releases
 
-- Versioned with SemVer in `pyproject.toml` (`version`); currently pre-1.0 (0.x). First tagged release was `v0.8.2`
-- Release flow: bump `pyproject.toml` `version` → matching annotated tag (`git tag -a vX.Y.Z`) → publish a GitHub Release from that tag. Keep pyproject version, tag, and release in lockstep. Tags carry a `v` prefix; `pyproject` stays bare
-- A version bump touches **two** files — `uv.lock` records the project's own version too, so commit `pyproject.toml` + `uv.lock` together (any `uv` command run after the bump re-syncs the lock)
-- Tags must be pushed explicitly (`git push origin vX.Y.Z`); a branch push (including via GitHub Desktop) does not carry them — verify with `git ls-remote --tags origin`
-- Release notes are written by hand: commits land directly on `main` (not via PRs), so GitHub's auto-generated notes have little to aggregate
+- Versioned with SemVer in `pyproject.toml` (`version`); currently pre-1.0 (0.x). First tagged release was `v0.8.2`. Tags carry a `v` prefix; `pyproject` stays bare
+- Releases are cut by the **`Release` workflow** (`.github/workflows/release.yml`), run from the Actions tab with a `patch`/`minor`/`major` choice. It runs the full CI gate, bumps the version, generates notes, commits, tags, pushes, and opens a **draft** GitHub Release. Nothing is published until you edit the draft and hit Publish
+- There is no artifact to publish: `pyproject.toml` has no `[build-system]` and `uv.lock` records the project as `source = { virtual = "." }`. A "release" here is only a tag plus a GitHub Release
+- The workflow bumps with `uv version --bump <part>`, which rewrites `pyproject.toml` **and** re-locks `uv.lock` in one command — a version bump touches **two** files, because the lock records the project's own version. Bumping by hand and forgetting the lock leaves it to be rewritten by the next `uv` command, potentially after tagging
+- Release notes are generated from **conventional commits** since the previous tag, grouped into Features / Fixes / Performance / Refactoring / Documentation (`chore`/`test`/`ci`/`build` are omitted as noise; the compare link covers them). GitHub's own `--generate-notes` is useless here — it aggregates merged PRs, and commits land directly on `main`. The draft exists because the hand-written Highlights/Requirements/Run blurb can't be derived from commits
+- The workflow is `workflow_dispatch`, **not** tag-triggered, and that is deliberate: a tag pushed with `GITHUB_TOKEN` does not trigger other workflows, so an `on: push: tags:` release job would silently never fire
+- Every `${{ }}` value is passed through a step-level `env:` block rather than inlined into a `run:` script — the standard defense against workflow command injection. `github.ref_name` is a branch name and must never be inlined
+- `main` has no branch protection or rulesets, which is what lets the workflow push the bump commit directly. Adding protection means allowlisting the Actions actor
+- Manual fallback, if the workflow is ever bypassed: bump → commit `pyproject.toml` + `uv.lock` together → `git tag -a vX.Y.Z` → `git push origin vX.Y.Z`. Tags must be pushed explicitly; a branch push (including via GitHub Desktop) does not carry them — verify with `git ls-remote --tags origin`
 
 ## Conventions
 

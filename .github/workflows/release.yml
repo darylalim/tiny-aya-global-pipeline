@@ -1,0 +1,129 @@
+name: Release
+
+# Dispatch-triggered rather than tag-triggered: this workflow *creates* the tag.
+# A tag pushed with GITHUB_TOKEN does not trigger other workflows, so an
+# `on: push: tags:` release job would silently never fire.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Semver bump"
+        type: choice
+        options: [patch, minor, major]
+        default: minor
+
+# The bump commit and the tag both need write access.
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Same runner as ci.yml: mlx-lm installs natively on Apple Silicon.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # changelog needs full history and tags
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies (core + dev tools)
+        run: uv sync
+
+      # Never cut a release from a red tree — same gate as ci.yml.
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run ty check
+
+      - name: Tests
+        run: uv run pytest test_streamlit_app.py test_streamlit_ui.py -q
+
+      # `uv version --bump` rewrites pyproject.toml *and* re-locks uv.lock, which
+      # records the project's own version. Bumping only pyproject leaves the lock
+      # stale until the next uv command rewrites it underneath you.
+      - name: Bump version
+        id: bump
+        # Interpolations are passed through env: rather than substituted into
+        # the script text, so no input can ever be parsed as shell.
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          uv version --bump "$BUMP"
+          echo "version=$(uv version --short)" >> "$GITHUB_OUTPUT"
+
+      # Commits land directly on main, so there are no merged PRs for GitHub's
+      # own --generate-notes to aggregate. Parse the conventional-commit log
+      # instead. Must run before the new tag exists, or the range collapses.
+      - name: Build changelog from conventional commits
+        id: notes
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          prev="$(git describe --tags --abbrev=0 || true)"
+          range=""
+          [ -n "$prev" ] && range="$prev..HEAD"
+          notes="$RUNNER_TEMP/notes.md"
+          : > "$notes"
+
+          section() {
+            body="$(git log --no-merges --format='%s' $range \
+                    | grep -E "^$1(\(.+\))?: " \
+                    | sed -E "s/^$1(\(.+\))?: /- /" || true)"
+            if [ -n "$body" ]; then
+              printf '### %s\n\n%s\n\n' "$2" "$body" >> "$notes"
+            fi
+          }
+
+          # chore/test/ci/build are deliberately omitted — the compare link
+          # below covers them, and they are noise in user-facing notes.
+          section feat     "Features"
+          section fix      "Fixes"
+          section perf     "Performance"
+          section refactor "Refactoring"
+          section docs     "Documentation"
+
+          if [ -n "$prev" ]; then
+            printf '**Full changelog:** %s/compare/%s...v%s\n' \
+              "$REPO_URL" "$prev" "$VERSION" >> "$notes"
+          fi
+          echo "path=$notes" >> "$GITHUB_OUTPUT"
+
+      - name: Commit, tag, push
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          # A branch name can contain shell metacharacters; never inline it.
+          REF: ${{ github.ref_name }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml uv.lock
+          git commit -m "chore: bump version to ${VERSION}"
+          git tag -a "v${VERSION}" -m "v${VERSION}"
+          git push origin "HEAD:${REF}" "refs/tags/v${VERSION}"
+
+      # Draft, not published: the generated sections are the part that must stay
+      # true, but the Highlights/Requirements/Run blurb can only be written by
+      # hand. Edit the draft, then publish.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          NOTES: ${{ steps.notes.outputs.path }}
+        run: |
+          gh release create "v${VERSION}" \
+            --draft \
+            --title "v${VERSION}" \
+            --notes-file "$NOTES"
