@@ -13,8 +13,13 @@ from streamlit_app import (
     clean_model_output,
     count_tokens,
     heading_level,
+    heading_line,
+    is_blank_markdown,
+    leading_headings,
     load_document_markdown,
+    pack_by_estimate,
     render_output,
+    sentence_units,
     split_oversized,
     stream_translate,
     token_overhead,
@@ -408,17 +413,73 @@ def test_load_document_markdown_returns_parsed_text(
 
 
 @patch("liteparse.LiteParse")
-def test_load_document_markdown_requests_quiet_markdown_without_ocr(
+def test_load_document_markdown_requests_quiet_markdown(
     mock_liteparse_cls: MagicMock,
 ) -> None:
+    mock_liteparse_cls.return_value.parse.return_value.text = "Body."
     load_document_markdown(b"data")
 
     kwargs = mock_liteparse_cls.call_args.kwargs
     assert kwargs["output_format"] == "markdown"
-    # OCR off: born-digital PDFs already carry a text layer. quiet: LiteParse
-    # otherwise prints timing lines into Streamlit's stdout.
-    assert kwargs["ocr_enabled"] is False
+    # quiet: LiteParse otherwise prints timing lines into Streamlit's stdout.
     assert kwargs["quiet"] is True
+
+
+@patch("liteparse.LiteParse")
+def test_load_document_markdown_enables_ocr_for_images(
+    mock_liteparse_cls: MagicMock,
+) -> None:
+    # Regression: forcing ocr_enabled=False made every image type in
+    # DOCUMENT_TYPES parse to an empty '```text```' fence. An image has no text
+    # layer, so OCR is the only way to read one.
+    mock_liteparse_cls.return_value.parse.return_value.text = "Body."
+    load_document_markdown(b"\x89PNG\r\n\x1a\n rest of the image")
+
+    assert mock_liteparse_cls.call_args.kwargs["ocr_enabled"] is True
+
+
+@patch("liteparse.LiteParse")
+def test_load_document_markdown_keeps_pdfs_offline(
+    mock_liteparse_cls: MagicMock,
+) -> None:
+    # A PDF carries a real text layer, and LiteParse's auto OCR downloads ~15 MB
+    # of Tesseract training data from GitHub the first time it fires. This app
+    # promises nothing leaves the machine, so the common path stays offline.
+    mock_liteparse_cls.return_value.parse.return_value.text = "Body."
+    load_document_markdown(b"%PDF-1.4\nrest of the file")
+
+    assert mock_liteparse_cls.call_args.kwargs["ocr_enabled"] is False
+
+
+@patch("liteparse.LiteParse")
+def test_load_document_markdown_survives_ocr_failure(
+    mock_liteparse_cls: MagicMock,
+) -> None:
+    # An OCR attempt that cannot fetch its data must not kill a parse whose
+    # text layer was readable all along.
+    mock_liteparse_cls.return_value.parse.return_value.text = "Body."
+    load_document_markdown(b"data")
+
+    assert mock_liteparse_cls.call_args.kwargs["ocr_failure_fatal"] is False
+
+
+@patch("liteparse.LiteParse")
+def test_load_document_markdown_blanks_an_empty_fence(
+    mock_liteparse_cls: MagicMock,
+) -> None:
+    # An unreadable file comes back as an empty code fence, which is not blank
+    # and would otherwise sail past the tab's "no translatable text" guard and
+    # be handed to the model as a prompt.
+    mock_liteparse_cls.return_value.parse.return_value.text = "```text\n\n```"
+
+    assert load_document_markdown(b"data") == ""
+
+
+def test_is_blank_markdown_keeps_real_fenced_content() -> None:
+    assert is_blank_markdown("```text\n\n```")
+    assert is_blank_markdown("   \n\n  ")
+    assert not is_blank_markdown("```text\nHello\n```")
+    assert not is_blank_markdown("# Title")
 
 
 # -- heading_level -------------------------------------------------------------
@@ -436,6 +497,36 @@ def test_heading_level_zero_for_non_headings() -> None:
     # Seven hashes is past the ATX limit, and #tag has no space delimiter.
     assert heading_level("####### Too deep") == 0
     assert heading_level("#hashtag not a heading") == 0
+
+
+def test_heading_level_reads_only_the_first_line() -> None:
+    # Blocks split on blank lines, so a heading with its opening body line
+    # attached is one block and still counts as a heading.
+    assert heading_level("## Section\nFirst body line.") == 2
+
+
+# -- heading_line --------------------------------------------------------------
+
+
+def test_heading_line_returns_only_the_first_line() -> None:
+    assert heading_line("## Section\nFirst body line.") == "## Section"
+    assert heading_line("# Title") == "# Title"
+
+
+def test_chunk_text_heading_trail_excludes_attached_body_text() -> None:
+    # Regression: the trail stored the whole block, so a heading followed
+    # immediately by its first line (no blank line between, which is ordinary
+    # in parsed markdown) prepended that body text to every later chunk and
+    # charged its tokens against the budget the trail reserves.
+    text = "# Title\nBody line under the heading\n\n" + "\n\n".join(
+        f"para{i} " + "word " * 20 for i in range(3)
+    )
+
+    chunks = chunk_text(text, FakeTokenizer(), max_tokens=40)
+
+    tail = next(c for c in chunks if "para2" in c)
+    assert "# Title" in tail
+    assert "Body line under the heading" not in tail
 
 
 # -- chunk_text ----------------------------------------------------------------
@@ -584,6 +675,110 @@ def test_chunk_text_respects_budget_when_tokenizer_adds_special_tokens() -> None
             assert size <= budget, f"{size} > {budget} for {chunk!r}"
 
 
+class DriftingTokenizer(SpecialTokenTokenizer):
+    """Whitespace tokenizer that spends an extra token where two blocks join.
+
+    A BPE tokenizer merges differently across a block boundary than inside one,
+    so an assembled chunk measures slightly more than the sum of its blocks. The
+    packer cannot see that drift while packing, so the finished chunk lands just
+    over budget -- the exact condition that used to shatter it into one prompt
+    per sentence. SpecialTokenTokenizer models the BOS and separator costs the
+    packer *does* account for; only this one reproduces the overflow.
+    """
+
+    def encode(self, text: str) -> list[str]:
+        tokens: list[str] = []
+        for i, part in enumerate(text.split("\n\n")):
+            if i:
+                tokens.append("\n\n")
+            words = part.split()
+            if i and words:
+                tokens.append("<merge>")
+            tokens.extend(words)
+        return ["<bos>", *tokens]
+
+    def decode(self, ids: list[str]) -> str:
+        # Drop the synthetic separator and merge markers so decode inverts
+        # encode. A real tokenizer round-trips its ids; leaving these in would
+        # write "<merge>" into the chunk text and fail tests for a defect in
+        # the fixture rather than in the code. The BOS is still left visible,
+        # as in the parent, so a genuinely leaked special token is caught.
+        return " ".join(i for i in ids if i not in {"\n\n", "<merge>"})
+
+
+def test_chunk_text_does_not_shatter_a_full_chunk_when_the_estimate_drifts() -> None:
+    # Regression: a packed chunk measuring one token over budget was split on
+    # every sentence boundary and the pieces appended straight to the output, so
+    # one full chunk became one chunk per sentence. Each is its own translation
+    # call stripped of its neighbours, turning a long document into hundreds of
+    # prompts. An upper bound on chunk size cannot see this -- only the count.
+    tok = DriftingTokenizer()
+    overhead = len(tok.encode(""))
+    text = "\n\n".join(f"Sentence {i}." for i in range(30))
+    budget = 60
+
+    chunks = chunk_text(text, tok, max_tokens=budget)
+
+    assert all(len(tok.encode(c)) - overhead <= budget for c in chunks)
+    # 30 two-token blocks against a 60-token budget is a handful of chunks;
+    # shattering produced one per sentence.
+    assert len(chunks) <= 5, f"chunk count blew up: {len(chunks)}"
+
+
+def test_chunk_text_drift_repack_keeps_blocks_separated() -> None:
+    # Re-packing works on whole blocks, so the blank lines between paragraphs
+    # survive. Splitting the assembled body on sentences instead would dissolve
+    # every paragraph, list and table boundary in the chunk.
+    tok = DriftingTokenizer()
+    text = "\n\n".join(f"Sentence {i}." for i in range(30))
+
+    chunks = chunk_text(text, tok, max_tokens=60)
+
+    # Thirty two-token blocks against a sixty-token budget: every chunk should
+    # hold many blocks. Splitting the body on sentences consumed the blank
+    # lines and emitted each sentence alone, leaving a run of singletons.
+    assert all(c.count("Sentence") > 1 for c in chunks), (
+        f"chunks were shattered into singletons: "
+        f"{[c.count('Sentence') for c in chunks]}"
+    )
+    # Blocks inside a chunk stay separated by the blank line they were split on.
+    assert all(c.count("\n\n") == c.count("Sentence") - 1 for c in chunks)
+
+
+def test_chunk_text_labels_every_piece_when_the_trail_is_still_empty() -> None:
+    # Regression: the first chunk opens before any heading has reached the
+    # trail, so its headings live in its own blocks. Pieces cut out of its
+    # middle contain neither those blocks nor a trail to draw them from, and
+    # reached the model as unlabelled fragments.
+    tok = DriftingTokenizer()
+    text = "# Handbook\n\n## Parts\n\n" + "\n\n".join(f"- Bolt {i}" for i in range(60))
+
+    chunks = chunk_text(text, tok, max_tokens=40)
+
+    assert len(chunks) > 1, "expected the document to split"
+    assert all("# Handbook" in c and "## Parts" in c for c in chunks)
+
+
+def test_leading_headings_stops_at_the_first_body_block() -> None:
+    # Only the headings a chunk *opens* with make prepended context redundant.
+    # A heading further in starts the next section, so the body ahead of it
+    # still needs its own section's heading.
+    assert leading_headings(["# A", "## B", "body", "## C"]) == ["# A", "## B"]
+    assert leading_headings(["body", "# A"]) == []
+    assert leading_headings([]) == []
+
+
+def test_pack_by_estimate_charges_the_join_cost() -> None:
+    # Regression: ignoring the separator between blocks let a group of 985
+    # blocks estimated at 5,792 tokens measure 7,760 -- a quarter over budget.
+    # The overflow then fell through to the path that strips heading context.
+    tok = FakeTokenizer()
+    units = ["a b"] * 10
+
+    assert len(pack_by_estimate(units, tok, 6, join_cost=0)) == 4
+    assert len(pack_by_estimate(units, tok, 6, join_cost=1)) == 5
+
+
 def test_chunk_text_does_not_leak_special_tokens_into_output() -> None:
     # The hard-split path slices token ids, so it must drop the BOS prefix
     # first or decode would write it back into the translated text.
@@ -617,11 +812,40 @@ def test_split_oversized_keeps_whole_sentences_when_they_fit() -> None:
     assert pieces == ["Alpha one.", "Beta two."]
 
 
-def test_split_oversized_handles_cjk_full_stops() -> None:
-    # The app translates across 67 languages, so CJK sentence enders count too.
-    pieces = split_oversized("第一文です。 第二文です。", FakeTokenizer(), 2)
+def test_split_oversized_repacks_sentences_up_to_the_budget() -> None:
+    # Regression: sentences used to be emitted one per piece regardless of the
+    # budget, so a body one token over turned into one prompt per sentence.
+    text = "Alpha one. Beta two. Gamma three. Delta four."
+    pieces = split_oversized(text, FakeTokenizer(), 4)
 
-    assert pieces == ["第一文です。", "第二文です。"]
+    assert pieces == ["Alpha one. Beta two.", "Gamma three. Delta four."]
+
+
+def test_sentence_units_splits_cjk_written_without_spaces() -> None:
+    # Regression: the boundary pattern required whitespace after the ender, but
+    # CJK writes 。 flush against the next sentence, so real CJK never split at
+    # all and fell through to mid-clause hard token windows. Chinese, Japanese,
+    # Korean, Thai and Lao are all in LANGUAGES.
+    units = sentence_units("第一文です。第二文です。第三文です。")
+
+    assert units == ["第一文です。", "第二文です。", "第三文です。"]
+
+
+def test_sentence_units_concatenate_back_to_the_source() -> None:
+    # Units carry their own trailing gap, so re-packing them cannot invent a
+    # space that the source never had -- which is exactly the CJK case.
+    for text in (
+        "Alpha one. Beta two.",
+        "第一文です。第二文です。",
+        "Mixed. 混在です。Tail sentence.",
+    ):
+        assert "".join(sentence_units(text)) == text
+
+
+def test_sentence_units_keep_decimals_intact() -> None:
+    # The Latin branch still demands whitespace after the ender, so a decimal
+    # point is not a sentence boundary.
+    assert sentence_units("Pi is 3.14 exactly.") == ["Pi is 3.14 exactly."]
 
 
 # -- cached_document_chunks ----------------------------------------------------

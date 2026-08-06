@@ -168,24 +168,66 @@ def stream_translate(
 
 _BLANK_LINE_RE = re.compile(r"\n\s*\n")
 # Sentence boundaries for Latin punctuation plus CJK full stops, since the app
-# translates across all 67 languages.
-_SENTENCE_RE = re.compile(r"(?<=[.!?。！？])\s+")
+# translates across all 67 languages. The two need different whitespace rules:
+# Latin prose separates sentences with a space (and requiring one is what keeps
+# "3.14" intact), while CJK writes 。！？ flush against the next sentence, so
+# demanding whitespace there means CJK never splits on a sentence at all.
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])\s*")
+# Fence markers, stripped when deciding whether a parse found any real text.
+_FENCE_RE = re.compile(r"```[a-zA-Z]*")
+
+
+def is_blank_markdown(text: str) -> bool:
+    """True when a parse produced no readable content.
+
+    A file LiteParse could not read comes back as an empty ```` ```text``` ````
+    fence. That is not blank, so it would sail past the Document tab's "no
+    translatable text" guard and be handed to the model as a prompt.
+    """
+    return not _FENCE_RE.sub("", text).strip()
 
 
 def load_document_markdown(file_bytes: bytes) -> str:
-    """Parse uploaded file bytes into a single markdown string via LiteParse."""
+    """Parse uploaded file bytes into a single markdown string via LiteParse.
+
+    Returns ``""`` when the file yielded no readable text.
+    """
     from liteparse import LiteParse
 
-    # ocr_enabled=False: born-digital PDFs carry a real text layer, and OCR on
-    # top of it is slower without changing the result. quiet=True keeps
-    # LiteParse's timing lines out of Streamlit's stdout.
-    parser = LiteParse(output_format="markdown", ocr_enabled=False, quiet=True)
-    return parser.parse(file_bytes).text
+    # OCR is enabled only where it is the sole extraction path. An image has no
+    # text layer, so reading it *requires* OCR -- forcing it off returned an
+    # empty '```text```' fence for every image type in DOCUMENT_TYPES. A PDF
+    # does carry a text layer, and LiteParse's auto mode would still reach for
+    # OCR on sparse pages, which downloads ~15 MB of Tesseract training data
+    # from GitHub on first use. This app's whole premise is that nothing leaves
+    # the machine, so PDFs -- the common case -- stay strictly offline.
+    # ocr_failure_fatal=False so an OCR attempt that cannot fetch its data
+    # never kills a parse whose text layer was readable all along.
+    # quiet=True keeps LiteParse's timing lines out of Streamlit's stdout.
+    parser = LiteParse(
+        output_format="markdown",
+        quiet=True,
+        ocr_enabled=not file_bytes.lstrip()[:4].startswith(b"%PDF"),
+        ocr_failure_fatal=False,
+    )
+    text = parser.parse(file_bytes).text
+    return "" if is_blank_markdown(text) else text
+
+
+def heading_line(block: str) -> str:
+    """Return ``block``'s first line.
+
+    Blocks are split on blank lines, so a markdown heading followed immediately
+    by its opening body line arrives as one block. The heading trail keeps this
+    line alone: storing the whole block would prepend that body text to every
+    later chunk and charge its tokens against the budget the trail reserves.
+    """
+    return block.lstrip().split("\n", 1)[0].rstrip()
 
 
 def heading_level(block: str) -> int:
     """Return the ATX markdown heading level of ``block``, or 0 if not a heading."""
-    marker = block.lstrip().split(" ", 1)[0]
+    marker = heading_line(block).split(" ", 1)[0]
     return len(marker) if marker and set(marker) == {"#"} and len(marker) <= 6 else 0
 
 
@@ -204,25 +246,186 @@ def count_tokens(text: str, tokenizer: Any) -> int:
     return len(tokenizer.encode(text)) - token_overhead(tokenizer)
 
 
+def sentence_units(text: str) -> list[str]:
+    """Split ``text`` after sentence enders, keeping each unit's trailing gap.
+
+    Units carry the whitespace that followed them, so concatenating them back
+    reproduces the source exactly -- CJK included, where the gap is empty and
+    rejoining on a space would insert one the original never had.
+    """
+    units: list[str] = []
+    start = 0
+    for match in _SENTENCE_RE.finditer(text):
+        if match.end() > start:
+            units.append(text[start : match.end()])
+            start = match.end()
+    if start < len(text):
+        units.append(text[start:])
+    return units
+
+
+def hard_windows(text: str, tokenizer: Any, max_tokens: int) -> list[str]:
+    """Cut ``text`` into fixed token windows -- the last resort when nothing
+    smaller fits.
+
+    Strips the BOS prefix before slicing, or ``decode`` would write the special
+    token back into the chunk as visible text.
+    """
+    ids = tokenizer.encode(text)[token_overhead(tokenizer) :]
+    return [
+        tokenizer.decode(ids[i : i + max_tokens])
+        for i in range(0, len(ids), max_tokens)
+    ]
+
+
+def pack_by_estimate(
+    units: list[str], tokenizer: Any, budget: int, join_cost: int = 0
+) -> list[list[str]]:
+    """Group ``units`` greedily using one token count per unit.
+
+    Measuring every growing candidate instead is quadratic: on a single
+    chunk-sized block it re-encodes the whole accumulating piece per unit and
+    costs tens of seconds. Callers verify each finished group once, which keeps
+    the guarantee while staying linear in the document length.
+
+    ``join_cost`` is charged for every join after the first. Callers that glue
+    units together with a separator must pass it: a thousand blocks joined by a
+    blank line cost a thousand tokens the per-unit counts cannot see, and
+    ignoring that overshot the budget by a quarter.
+    """
+    groups: list[list[str]] = []
+    current: list[str] = []
+    running = 0
+    for unit in units:
+        size = count_tokens(unit, tokenizer)
+        if current and running + size + join_cost > budget:
+            groups.append(current)
+            current, running = [], 0
+        elif current:
+            size += join_cost
+        current.append(unit)
+        running += size
+    if current:
+        groups.append(current)
+    return groups
+
+
 def split_oversized(block: str, tokenizer: Any, max_tokens: int) -> list[str]:
-    """Split a single over-budget block into pieces that each fit ``max_tokens``."""
+    """Split a single over-budget block into pieces that each fit ``max_tokens``.
+
+    Sentences are re-packed up to the budget rather than emitted one per piece.
+    Without that, a chunk overflowing by a single token exploded into one piece
+    per sentence -- hundreds of separate translation calls, each stripped of the
+    neighbours that gave it context.
+    """
+    units: list[str] = []
+    for unit in sentence_units(block):
+        if not unit.strip():
+            continue
+        if count_tokens(unit, tokenizer) <= max_tokens:
+            units.append(unit)
+            continue
+        # A single sentence over budget: an unpunctuated wall of text, or a
+        # script whose sentence enders this pattern does not know.
+        windows = hard_windows(unit, tokenizer, max_tokens)
+        # Windows are cut mid-text, so they carry no trailing gap of their own.
+        units.extend(w + " " for w in windows[:-1])
+        units.extend(windows[-1:])
+
     pieces: list[str] = []
-    overhead = token_overhead(tokenizer)
-    for sentence in _SENTENCE_RE.split(block):
-        if not sentence:
+    for group in pack_by_estimate(units, tokenizer, max_tokens):
+        text = "".join(group).strip()
+        if not text:
             continue
-        if count_tokens(sentence, tokenizer) <= max_tokens:
-            pieces.append(sentence)
+        measured = count_tokens(text, tokenizer)
+        if measured <= max_tokens:
+            pieces.append(text)
             continue
-        # A single sentence over budget (unpunctuated wall of text, or a table
-        # dumped as one block): fall back to hard token windows. Drop the BOS
-        # prefix first, or it would be decoded back into the chunk as text.
-        ids = tokenizer.encode(sentence)[overhead:]
-        pieces.extend(
-            tokenizer.decode(ids[i : i + max_tokens])
-            for i in range(0, len(ids), max_tokens)
-        )
+        # The estimate drifted (a tokenizer merges across unit boundaries).
+        # Re-pack this group alone against a budget cut by the overshoot.
+        for sub in pack_by_estimate(
+            group, tokenizer, max(2 * max_tokens - measured, 1)
+        ):
+            sub_text = "".join(sub).strip()
+            if count_tokens(sub_text, tokenizer) <= max_tokens:
+                pieces.append(sub_text)
+            else:
+                pieces.extend(
+                    w.strip()
+                    for w in hard_windows(sub_text, tokenizer, max_tokens)
+                    if w.strip()
+                )
     return pieces
+
+
+def leading_headings(blocks: list[str]) -> list[str]:
+    """Return the headings ``blocks`` opens with, before its first body block.
+
+    Only these make prepended context redundant. A heading further in is the
+    *next* section starting inside the chunk, so the body ahead of it still
+    needs its own section's heading prepended.
+    """
+    found: list[str] = []
+    for block in blocks:
+        if not heading_level(block):
+            break
+        found.append(heading_line(block))
+    return found
+
+
+def repack_blocks(
+    headings: list[str], blocks: list[str], tokenizer: Any, max_tokens: int
+) -> list[str]:
+    """Re-pack ``blocks`` into chunks that each carry their own heading context.
+
+    The greedy packer estimates a chunk by summing its blocks, but a BPE
+    tokenizer merges across block boundaries, so the finished chunk can measure
+    a token or two over. Re-packing whole blocks keeps the blank lines between
+    them -- splitting the assembled body on sentences instead would dissolve
+    every paragraph, table and list in it.
+
+    ``headings`` is the full trail, not the caller's already-deduplicated
+    context: a piece cut from the middle of a chunk contains none of the
+    headings the first piece opened with, so it has to have them prepended or
+    it reaches the model as an unlabelled fragment.
+    """
+
+    # A chunk that opens with its own headings carries them as blocks, not in
+    # the trail -- the trail was still empty when it opened. Pieces cut from
+    # its middle contain neither, so those headings have to join the context or
+    # every piece after the first reaches the model unlabelled.
+    context = [*headings, *(h for h in leading_headings(blocks) if h not in headings)]
+
+    def assemble(body: list[str]) -> str:
+        own = leading_headings(body)
+        return "\n\n".join([*[h for h in context if h not in own], *body])
+
+    separator = count_tokens("\n\n", tokenizer)
+    overhead = sum(count_tokens(h, tokenizer) + separator for h in context)
+    # Each join costs the blank line plus about a token of merge drift the
+    # per-block counts cannot see.
+    join_cost = separator + 1
+    budget = max(max_tokens - overhead, 1)
+
+    packed: list[str] = []
+    for group in pack_by_estimate(blocks, tokenizer, budget, join_cost):
+        text = assemble(group)
+        measured = count_tokens(text, tokenizer)
+        if measured <= max_tokens:
+            packed.append(text)
+            continue
+        # The estimate still drifted over. Re-pack this group alone against a
+        # budget cut by the overshoot, assembling each sub-group so it keeps
+        # its heading context -- falling straight through to sentence
+        # splitting here is what stripped the context off middle pieces.
+        tighter = max(budget - (measured - max_tokens), 1)
+        for sub in pack_by_estimate(group, tokenizer, tighter, join_cost):
+            sub_text = assemble(sub)
+            if count_tokens(sub_text, tokenizer) <= max_tokens:
+                packed.append(sub_text)
+            else:
+                packed.extend(split_oversized(sub_text, tokenizer, max_tokens))
+    return packed
 
 
 def chunk_text(
@@ -259,15 +462,19 @@ def chunk_text(
         nonlocal current, current_tokens, pending, pending_tokens
         if not current:
             return
-        # Skip any heading the chunk already opens with, so context is not
-        # duplicated at the top of the chunk.
-        context = [pending[lv] for lv in sorted(pending) if pending[lv] != current[0]]
+        # Skip only the headings the chunk *opens* with -- those alone make the
+        # prepended context redundant. A heading deeper in the chunk starts the
+        # next section, and the body ahead of it still needs its own label.
+        headings = [pending[lv] for lv in sorted(pending)]
+        opening = leading_headings(current)
+        context = [h for h in headings if h not in opening]
         body = "\n\n".join([*context, *current])
         # Packing sums per-block counts, but a tokenizer merges across block
-        # boundaries, so the assembled chunk can run a little over. Measure the
-        # real thing and split it if the estimate drifted past the budget.
+        # boundaries, so the assembled chunk can run a little over. Re-pack the
+        # blocks against measured sizes rather than splitting the body, which
+        # would shatter a full chunk into one prompt per sentence.
         if count_tokens(body, tokenizer) > max_tokens:
-            chunks.extend(split_oversized(body, tokenizer, max_tokens))
+            chunks.extend(repack_blocks(headings, current, tokenizer, max_tokens))
         else:
             chunks.append(body)
         current = []
@@ -297,7 +504,7 @@ def chunk_text(
         if level := heading_level(block):
             # A deeper heading replaces its siblings; shallower ones survive.
             trail = {lv: h for lv, h in trail.items() if lv < level}
-            trail[level] = block
+            trail[level] = heading_line(block)
             # Each context heading is followed by a separator when rendered.
             trail_tokens = sum(
                 count_tokens(h, tokenizer) + separator for h in trail.values()

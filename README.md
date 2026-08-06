@@ -17,7 +17,7 @@ Translate text and whole documents across **67 languages** entirely on your Mac.
 
 - Local inference — no API key required, nothing leaves your machine
 - 67 languages across Europe, West Asia, South Asia, Asia Pacific, and Africa
-- Translate text and documents (PDF and images) — parsed locally with LiteParse, no model weights to download
+- Translate text and documents — PDFs parse locally with LiteParse and never touch the network; image uploads are OCR'd (first one downloads ~15 MB of English OCR data)
 - Side-by-side translation with streaming output
 - Cached document parsing for fast re-translation
 - Swap and download controls
