@@ -7,20 +7,13 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
 dependencies = [
+    "liteparse>=2.11.1",
     "mlx-lm>=0.31.3",
     "streamlit>=1.58.0",
 ]
 
 [project.urls]
 Repository = "https://github.com/darylalim/tiny-aya-translate"
-
-[project.optional-dependencies]
-docs = [
-    "docling>=2.103.0",
-]
-lite = [
-    "liteparse>=0.1.0",
-]
 
 [dependency-groups]
 dev = [

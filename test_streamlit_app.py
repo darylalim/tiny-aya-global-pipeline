@@ -9,14 +9,10 @@ import streamlit_app
 from streamlit_app import (
     LANGUAGES,
     build_translation_prompt,
-    chunk_document,
     chunk_text,
     clean_model_output,
     count_tokens,
-    docling_available,
     heading_level,
-    liteparse_available,
-    load_document,
     load_document_markdown,
     render_output,
     split_oversized,
@@ -386,125 +382,16 @@ def test_stream_translate_uses_default_params(
     )
 
 
-# -- docling_available ---------------------------------------------------------
+# -- DOCUMENT_TYPES ------------------------------------------------------------
 
 
-@patch("importlib.util.find_spec")
-def test_docling_available_true_when_spec_found(mock_find_spec: MagicMock) -> None:
-    mock_find_spec.return_value = object()
-    assert docling_available() is True
-
-
-@patch("importlib.util.find_spec")
-def test_docling_available_false_when_spec_missing(
-    mock_find_spec: MagicMock,
-) -> None:
-    mock_find_spec.return_value = None
-    assert docling_available() is False
-
-
-# -- load_document -------------------------------------------------------------
-
-
-@patch("docling.document_converter.DocumentConverter")
-def test_load_document_returns_converted_document(
-    mock_converter_cls: MagicMock,
-) -> None:
-    expected_doc = MagicMock()
-    mock_converter_cls.return_value.convert.return_value.document = expected_doc
-
-    assert load_document(b"file bytes", "sample.pdf") is expected_doc
-
-
-@patch("docling.document_converter.DocumentConverter")
-def test_load_document_builds_stream_with_filename(
-    mock_converter_cls: MagicMock,
-) -> None:
-    load_document(b"data", "report.docx")
-
-    source = mock_converter_cls.return_value.convert.call_args[0][0]
-    assert source.name == "report.docx"
-
-
-@patch("docling.document_converter.DocumentConverter")
-def test_load_document_passes_file_bytes_to_stream(
-    mock_converter_cls: MagicMock,
-) -> None:
-    load_document(b"hello bytes", "notes.html")
-
-    source = mock_converter_cls.return_value.convert.call_args[0][0]
-    assert source.stream.getvalue() == b"hello bytes"
-
-
-# -- chunk_document ------------------------------------------------------------
-
-
-@patch("docling.chunking.HybridChunker")
-@patch("docling_core.transforms.chunker.tokenizer.huggingface.HuggingFaceTokenizer")
-def test_chunk_document_returns_contextualized_strings(
-    mock_hf_tokenizer: MagicMock, mock_hybrid_chunker_cls: MagicMock
-) -> None:
-    chunker = mock_hybrid_chunker_cls.return_value
-    chunker.chunk.return_value = ["raw_a", "raw_b"]
-    chunker.contextualize.side_effect = ["context A", "context B"]
-
-    result = chunk_document(MagicMock(), MagicMock())
-
-    assert result == ["context A", "context B"]
-
-
-@patch("docling.chunking.HybridChunker")
-@patch("docling_core.transforms.chunker.tokenizer.huggingface.HuggingFaceTokenizer")
-def test_chunk_document_handles_empty_document(
-    mock_hf_tokenizer: MagicMock, mock_hybrid_chunker_cls: MagicMock
-) -> None:
-    mock_hybrid_chunker_cls.return_value.chunk.return_value = []
-
-    assert chunk_document(MagicMock(), MagicMock()) == []
-
-
-@patch("docling.chunking.HybridChunker")
-@patch("docling_core.transforms.chunker.tokenizer.huggingface.HuggingFaceTokenizer")
-def test_chunk_document_passes_max_tokens_to_tokenizer(
-    mock_hf_tokenizer: MagicMock, mock_hybrid_chunker_cls: MagicMock
-) -> None:
-    mock_hybrid_chunker_cls.return_value.chunk.return_value = []
-
-    chunk_document(MagicMock(), MagicMock(), max_tokens=1234)
-
-    assert mock_hf_tokenizer.call_args.kwargs["max_tokens"] == 1234
-
-
-@patch("docling.chunking.HybridChunker")
-@patch("docling_core.transforms.chunker.tokenizer.huggingface.HuggingFaceTokenizer")
-def test_chunk_document_defaults_to_max_chunk_tokens(
-    mock_hf_tokenizer: MagicMock, mock_hybrid_chunker_cls: MagicMock
-) -> None:
-    mock_hybrid_chunker_cls.return_value.chunk.return_value = []
-
-    chunk_document(MagicMock(), MagicMock())
-
-    assert (
-        mock_hf_tokenizer.call_args.kwargs["max_tokens"]
-        == streamlit_app.MAX_CHUNK_TOKENS
-    )
-
-
-# -- liteparse_available -------------------------------------------------------
-
-
-@patch("importlib.util.find_spec")
-def test_liteparse_available_true_when_spec_found(mock_find_spec: MagicMock) -> None:
-    mock_find_spec.return_value = object()
-    assert liteparse_available() is True
-
-
-@patch("importlib.util.find_spec")
-def test_liteparse_available_false_when_spec_missing(
-    mock_find_spec: MagicMock,
-) -> None:
-    mock_find_spec.return_value = None
-    assert liteparse_available() is False
+def test_document_types_are_liteparse_native() -> None:
+    # PDFs and images parse with no external binary. Office formats would need
+    # LibreOffice on PATH and HTML is unsupported, so neither is offered rather
+    # than accepting an upload that fails at parse time.
+    assert "pdf" in streamlit_app.DOCUMENT_TYPES
+    assert "png" in streamlit_app.DOCUMENT_TYPES
+    assert not {"docx", "pptx", "xlsx", "html"} & set(streamlit_app.DOCUMENT_TYPES)
 
 
 # -- load_document_markdown ----------------------------------------------------
@@ -740,55 +627,10 @@ def test_split_oversized_handles_cjk_full_stops() -> None:
 # -- cached_document_chunks ----------------------------------------------------
 
 
-@patch("streamlit_app.chunk_document")
-@patch("streamlit_app.load_document")
-@patch("streamlit_app.load_model")
-def test_cached_document_chunks_composes_load_and_chunk(
-    mock_load_model: MagicMock,
-    mock_load_document: MagicMock,
-    mock_chunk_document: MagicMock,
-) -> None:
-    cached = streamlit_app.cached_document_chunks
-    cached.clear()
-    tokenizer = MagicMock()
-    mock_load_model.return_value = (MagicMock(), tokenizer)
-    doc = MagicMock()
-    mock_load_document.return_value = doc
-    mock_chunk_document.return_value = ["chunk a", "chunk b"]
-
-    result = cached(b"bytes", "report.pdf")
-
-    # Pulls the tokenizer from load_model() rather than taking it as an arg, then
-    # composes load_document -> chunk_document.
-    assert result == ["chunk a", "chunk b"]
-    mock_load_document.assert_called_once_with(b"bytes", "report.pdf")
-    mock_chunk_document.assert_called_once_with(
-        doc, tokenizer, streamlit_app.MAX_CHUNK_TOKENS
-    )
-
-
-@patch("streamlit_app.chunk_document")
-@patch("streamlit_app.load_document")
-@patch("streamlit_app.load_model")
-def test_cached_document_chunks_forwards_custom_max_tokens(
-    mock_load_model: MagicMock,
-    _mock_load_document: MagicMock,
-    mock_chunk_document: MagicMock,
-) -> None:
-    cached = streamlit_app.cached_document_chunks
-    cached.clear()
-    mock_load_model.return_value = (MagicMock(), MagicMock())
-    mock_chunk_document.return_value = []
-
-    cached(b"x", "a.pdf", max_tokens=1234)
-
-    assert mock_chunk_document.call_args[0][2] == 1234
-
-
 @patch("streamlit_app.chunk_text")
 @patch("streamlit_app.load_document_markdown")
 @patch("streamlit_app.load_model")
-def test_cached_document_chunks_routes_liteparse_backend(
+def test_cached_document_chunks_composes_parse_and_chunk(
     mock_load_model: MagicMock,
     mock_load_markdown: MagicMock,
     mock_chunk_text: MagicMock,
@@ -798,12 +640,14 @@ def test_cached_document_chunks_routes_liteparse_backend(
     tokenizer = MagicMock()
     mock_load_model.return_value = (MagicMock(), tokenizer)
     mock_load_markdown.return_value = "# Doc\n\nBody."
-    mock_chunk_text.return_value = ["chunk"]
+    mock_chunk_text.return_value = ["chunk a", "chunk b"]
 
-    result = cached(b"bytes", "report.pdf", streamlit_app.PARSER_LITEPARSE)
+    result = cached(b"bytes")
 
-    assert result == ["chunk"]
-    # LiteParse takes bytes only -- it sniffs the format itself, no filename.
+    # Pulls the tokenizer from load_model() rather than taking it as an arg,
+    # then composes load_document_markdown -> chunk_text. LiteParse sniffs the
+    # format itself, so no filename is threaded through.
+    assert result == ["chunk a", "chunk b"]
     mock_load_markdown.assert_called_once_with(b"bytes")
     mock_chunk_text.assert_called_once_with(
         "# Doc\n\nBody.", tokenizer, streamlit_app.MAX_CHUNK_TOKENS
@@ -812,46 +656,29 @@ def test_cached_document_chunks_routes_liteparse_backend(
 
 @patch("streamlit_app.chunk_text")
 @patch("streamlit_app.load_document_markdown")
-@patch("streamlit_app.chunk_document")
-@patch("streamlit_app.load_document")
 @patch("streamlit_app.load_model")
-def test_cached_document_chunks_backend_selects_one_path_only(
+def test_cached_document_chunks_forwards_custom_max_tokens(
     mock_load_model: MagicMock,
-    mock_load_document: MagicMock,
-    mock_chunk_document: MagicMock,
-    mock_load_markdown: MagicMock,
+    _mock_load_markdown: MagicMock,
     mock_chunk_text: MagicMock,
 ) -> None:
     cached = streamlit_app.cached_document_chunks
     cached.clear()
     mock_load_model.return_value = (MagicMock(), MagicMock())
-    mock_chunk_document.return_value = []
+    mock_chunk_text.return_value = []
 
-    cached(b"bytes", "report.pdf", streamlit_app.PARSER_DOCLING)
+    cached(b"x", max_tokens=1234)
 
-    # The Docling path must not touch LiteParse, so an uninstalled LiteParse
-    # can never break a Docling parse.
-    mock_load_document.assert_called_once()
-    mock_load_markdown.assert_not_called()
-    mock_chunk_text.assert_not_called()
-
-
-def test_cached_document_chunks_keys_on_backend() -> None:
-    # backend is part of the cache key: switching parsers on the same upload
-    # must re-parse rather than return the other backend's chunks.
-    source = "".join(_APP_SOURCE.split())
-    assert "defcached_document_chunks(file_bytes:bytes,filename:str,backend:str" in (
-        source
-    )
+    assert mock_chunk_text.call_args[0][2] == 1234
 
 
 def test_document_tab_calls_cache_wrapper() -> None:
     # AppTest can't drive st.file_uploader, so guard the wiring at the source
     # level: the Document tab must go through cached_document_chunks, not call
-    # load_document/chunk_document directly (which would silently bypass the
-    # parse+chunk cache). Strip whitespace so line-wrapping can't break the match.
+    # load_document_markdown/chunk_text directly (which would silently bypass
+    # the parse+chunk cache). Strip whitespace so wrapping can't break the match.
     compact = "".join(_APP_SOURCE.split())
-    assert "cached_document_chunks(uploaded.getvalue(),uploaded.name,parser)" in compact
+    assert "cached_document_chunks(uploaded.getvalue())" in compact
 
 
 # -- translate_document --------------------------------------------------------

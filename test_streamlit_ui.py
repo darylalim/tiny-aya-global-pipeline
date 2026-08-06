@@ -347,43 +347,13 @@ def test_document_download_button_disabled_when_no_output(app: AppTest) -> None:
     assert app.get("download_button")[1].disabled  # ty: ignore[unresolved-attribute]
 
 
-def _run_without_parsers(*missing: str) -> AppTest:
-    """Run the app with the named parser packages hidden from find_spec."""
-    import importlib.util
-
-    real_find_spec = importlib.util.find_spec
-
-    def fake_find_spec(name: str, package: str | None = None):
-        if name in missing:
-            return None
-        return real_find_spec(name, package)
-
-    with (
-        patch("mlx_lm.load", return_value=(MagicMock(), MagicMock())),
-        patch("importlib.util.find_spec", side_effect=fake_find_spec),
-    ):
-        at = AppTest.from_file("streamlit_app.py")
-        at.run(timeout=60)
-    return at
+def test_document_tab_needs_no_install_hint(app: AppTest) -> None:
+    # liteparse is a required dependency now, so the tab is never gated behind
+    # an extra and there is nothing for the user to install.
+    assert not any("uv sync" in str(i.value) for i in app.info)
 
 
-def test_document_tab_install_hint_when_no_parser_installed() -> None:
-    # The tab needs *some* parser; the hint names both extras.
-    at = _run_without_parsers("docling", "liteparse")
-
-    info_values = [str(i.value) for i in at.info]
-    assert any("uv sync --extra docs" in v for v in info_values)
-    assert any("uv sync --extra lite" in v for v in info_values)
-
-
-def test_document_tab_works_with_only_one_parser_installed() -> None:
-    # Docling missing but LiteParse present: no install hint, and the radio
-    # offers only the backend that is actually importable.
-    at = _run_without_parsers("docling")
-
-    assert not any("uv sync" in str(i.value) for i in at.info)
-    assert at.radio("doc_parser").options == ["LiteParse"]
-
-
-def test_document_parser_radio_lists_both_when_installed(app: AppTest) -> None:
-    assert app.radio("doc_parser").options == ["Docling", "LiteParse"]
+def test_document_uploader_offers_no_parser_choice(app: AppTest) -> None:
+    # One parser, so no backend radio -- the Text tab's swap button and the two
+    # language selectboxes per tab are the only widgets of their kind.
+    assert not [r for r in app.radio]

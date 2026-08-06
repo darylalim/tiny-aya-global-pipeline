@@ -17,16 +17,9 @@ MAX_INPUT_TOKENS: int = 8192
 # Chunk budget for document translation: well below MAX_INPUT_TOKENS to leave
 # room for the per-chunk prompt wrapper (instruction + chat template).
 MAX_CHUNK_TOKENS: int = 7000
-DOCUMENT_TYPES: list[str] = ["pdf", "docx", "pptx", "xlsx", "html"]
-
-# Document parser backends. Docling is model-based (accurate on hard layouts,
-# ~500 MB of weights, pulls in PyTorch); LiteParse is heuristic (one 11 MB
-# wheel, no weights, far faster) but ships no chunker -- see chunk_text.
-PARSER_DOCLING: str = "Docling"
-PARSER_LITEPARSE: str = "LiteParse"
-# LiteParse handles PDFs and images natively; Office formats need LibreOffice
-# on PATH and HTML is unsupported, so the uploader narrows to what always works.
-LITE_DOCUMENT_TYPES: list[str] = ["pdf", "png", "jpg", "jpeg", "tiff", "webp"]
+# LiteParse handles PDFs and images natively. Office formats additionally need
+# LibreOffice on PATH, so they are left out rather than failing at parse time.
+DOCUMENT_TYPES: list[str] = ["pdf", "png", "jpg", "jpeg", "tiff", "webp"]
 
 # Shared UI constants reused across the Text and Document tabs.
 PANEL_HEIGHT: int = 450
@@ -169,60 +162,14 @@ def stream_translate(
         yield clean_model_output(accumulated)
 
 
-# -- Document functions (optional docling dependency) -------------------------
-
-
-def docling_available() -> bool:
-    """Return True if the optional ``docling`` dependency is importable."""
-    import importlib.util
-
-    return importlib.util.find_spec("docling") is not None
-
-
-def load_document(file_bytes: bytes, filename: str) -> Any:
-    """Parse uploaded file bytes into a ``DoclingDocument``."""
-    import io
-
-    from docling.datamodel.base_models import DocumentStream
-    from docling.document_converter import DocumentConverter
-
-    source = DocumentStream(name=filename, stream=io.BytesIO(file_bytes))
-    return DocumentConverter().convert(source).document
-
-
-def chunk_document(
-    doc: Any, tokenizer: Any, max_tokens: int = MAX_CHUNK_TOKENS
-) -> list[str]:
-    """Split a ``DoclingDocument`` into structure-aware text chunks."""
-    from docling.chunking import HybridChunker
-    from docling_core.transforms.chunker.tokenizer.huggingface import (
-        HuggingFaceTokenizer,
-    )
-
-    # HybridChunker's token budget lives on the tokenizer; mlx-lm wraps the
-    # real Hugging Face tokenizer, so unwrap it via ._tokenizer.
-    dl_tokenizer = HuggingFaceTokenizer(
-        tokenizer=tokenizer._tokenizer, max_tokens=max_tokens
-    )
-    chunker = HybridChunker(tokenizer=dl_tokenizer)
-    return [chunker.contextualize(chunk=c) for c in chunker.chunk(doc)]
-
-
-# -- LiteParse document path (optional lite dependency) -----------------------
+# -- Document functions -------------------------------------------------------
 # LiteParse parses to markdown but ships no chunker, so chunk_text below is the
-# token-aware packer that HybridChunker provides on the docling path.
+# token-aware packer that splits a document into translatable pieces.
 
 _BLANK_LINE_RE = re.compile(r"\n\s*\n")
 # Sentence boundaries for Latin punctuation plus CJK full stops, since the app
 # translates across all 67 languages.
 _SENTENCE_RE = re.compile(r"(?<=[.!?。！？])\s+")
-
-
-def liteparse_available() -> bool:
-    """Return True if the optional ``liteparse`` dependency is importable."""
-    import importlib.util
-
-    return importlib.util.find_spec("liteparse") is not None
 
 
 def load_document_markdown(file_bytes: bytes) -> str:
@@ -283,13 +230,13 @@ def chunk_text(
 ) -> list[str]:
     """Pack markdown paragraphs into chunks that stay under ``max_tokens``.
 
-    The token-aware counterpart to ``chunk_document`` for the LiteParse path.
-    Blocks are packed greedily so each chunk carries as much as it can hold,
-    paragraphs are never split unless one alone exceeds the budget, and the
-    enclosing markdown headings are prepended to chunks that do not already
-    open with them -- the same context that ``HybridChunker.contextualize``
-    supplies, and which matters here because every chunk is translated as an
-    independent prompt with no memory of its neighbours.
+    LiteParse returns one markdown string and no chunker, so this is where a
+    document becomes translatable pieces. Blocks are packed greedily so each
+    chunk carries as much as it can hold, paragraphs are never split unless one
+    alone exceeds the budget, and the enclosing markdown headings are prepended
+    to chunks that do not already open with them -- context that matters because
+    every chunk is translated as an independent prompt with no memory of its
+    neighbours.
     """
     blocks = [b.strip() for b in _BLANK_LINE_RE.split(text) if b.strip()]
     chunks: list[str] = []
@@ -402,25 +349,18 @@ def load_model() -> tuple[Any, Any]:
 
 @st.cache_data(max_entries=8, show_spinner=False)
 def cached_document_chunks(
-    file_bytes: bytes,
-    filename: str,
-    backend: str = PARSER_DOCLING,
-    max_tokens: int = MAX_CHUNK_TOKENS,
+    file_bytes: bytes, max_tokens: int = MAX_CHUNK_TOKENS
 ) -> list[str]:
-    """Parse + chunk an uploaded document, cached by file bytes, name and backend.
+    """Parse + chunk an uploaded document, cached by file bytes.
 
     Re-translating the same upload (e.g. into another language) then skips the
-    expensive parse + chunk. ``backend`` is part of the cache key so switching
-    parsers re-parses instead of returning the other backend's chunks. The
-    tokenizer is fetched from the cached ``load_model()`` rather than taken as an
-    argument, since it is unhashable and would defeat ``@st.cache_data``'s
-    argument hashing.
+    parse + chunk. The bytes are the whole key: LiteParse sniffs the format
+    itself, so the filename never reaches the parser. The tokenizer is fetched
+    from the cached ``load_model()`` rather than taken as an argument, since it
+    is unhashable and would defeat ``@st.cache_data``'s argument hashing.
     """
     _, tokenizer = load_model()
-    if backend == PARSER_LITEPARSE:
-        return chunk_text(load_document_markdown(file_bytes), tokenizer, max_tokens)
-    doc = load_document(file_bytes, filename)
-    return chunk_document(doc, tokenizer, max_tokens)
+    return chunk_text(load_document_markdown(file_bytes), tokenizer, max_tokens)
 
 
 def render_output(placeholder: Any, text: str) -> None:
@@ -603,145 +543,105 @@ with text_tab:
                     st.rerun()
 
 with doc_tab:
-    parsers = [
-        name
-        for name, installed in (
-            (PARSER_DOCLING, docling_available()),
-            (PARSER_LITEPARSE, liteparse_available()),
-        )
-        if installed
-    ]
-    if not parsers:
-        st.info(
-            "Document translation needs a parser: `uv sync --extra docs` for "
-            "Docling, or `uv sync --extra lite` for LiteParse.",
-            icon=":material/download:",
-        )
-    else:
-        # -- Parser backend ---------------------------------------------------
+    # -- Language bar ---------------------------------------------------------
 
-        # Seeded here rather than with the other setdefault() calls because the
-        # valid options depend on which extras are installed; this also resets a
-        # stored choice whose backend has since been uninstalled.
-        if st.session_state.get("doc_parser") not in parsers:
-            st.session_state.doc_parser = parsers[0]
-        st.radio(
-            "Parser",
-            parsers,
-            key="doc_parser",
-            horizontal=True,
-            help=(
-                "Docling: model-based, better on dense tables and scans. "
-                "LiteParse: heuristic, no model weights, much faster to start."
-            ),
-        )
-        parser = st.session_state.doc_parser
+    with st.container(border=True):
+        doc_col_from, doc_col_to = st.columns(2)
+        with doc_col_from:
+            st.selectbox(
+                "From",
+                LANGUAGES,
+                key="doc_source_lang",
+                label_visibility="collapsed",
+            )
+        with doc_col_to:
+            st.selectbox(
+                "To",
+                LANGUAGES,
+                key="doc_target_lang",
+                label_visibility="collapsed",
+            )
 
-        # -- Language bar -----------------------------------------------------
+    # -- Upload + controls ----------------------------------------------------
 
-        with st.container(border=True):
-            doc_col_from, doc_col_to = st.columns(2)
-            with doc_col_from:
-                st.selectbox(
-                    "From",
-                    LANGUAGES,
-                    key="doc_source_lang",
-                    label_visibility="collapsed",
-                )
-            with doc_col_to:
-                st.selectbox(
-                    "To",
-                    LANGUAGES,
-                    key="doc_target_lang",
-                    label_visibility="collapsed",
-                )
+    uploaded = st.file_uploader(
+        "Upload a document",
+        type=DOCUMENT_TYPES,
+        label_visibility="collapsed",
+    )
+    translate_doc_clicked = st.button(
+        "Translate document",
+        key="translate_doc",
+        disabled=not (model_loaded and uploaded is not None),
+        type="primary",
+        width="stretch",
+    )
 
-        # -- Upload + controls ------------------------------------------------
+    # -- Warning slot + streamed output ---------------------------------------
 
-        uploaded = st.file_uploader(
-            "Upload a document",
-            type=(
-                LITE_DOCUMENT_TYPES if parser == PARSER_LITEPARSE else DOCUMENT_TYPES
-            ),
-            label_visibility="collapsed",
-        )
-        translate_doc_clicked = st.button(
-            "Translate document",
-            key="translate_doc",
-            disabled=not (model_loaded and uploaded is not None),
-            type="primary",
-            width="stretch",
-        )
+    doc_warning_slot = st.container()
+    doc_output_placeholder = st.empty()
+    if st.session_state.doc_output:
+        render_output(doc_output_placeholder, st.session_state.doc_output)
 
-        # -- Warning slot + streamed output -----------------------------------
+    # -- Process document translation -----------------------------------------
 
-        doc_warning_slot = st.container()
-        doc_output_placeholder = st.empty()
-        if st.session_state.doc_output:
-            render_output(doc_output_placeholder, st.session_state.doc_output)
-
-        # -- Process document translation -------------------------------------
-
-        if translate_doc_clicked and uploaded is not None:
-            if st.session_state.doc_source_lang == st.session_state.doc_target_lang:
-                doc_warning_slot.warning(SAME_LANGUAGE_WARNING)
-            else:
-                result = ""
-                try:
-                    with st.spinner(f"Reading document with {parser}..."):
-                        chunks = cached_document_chunks(
-                            uploaded.getvalue(), uploaded.name, parser
-                        )
-                    if not chunks:
-                        doc_warning_slot.warning(
-                            "No translatable text found in the document."
-                        )
-                    else:
-                        progress = st.progress(0.0)
-                        status = st.empty()
-                        last_rendered = -1
-                        for idx, cumulative in translate_document(
-                            chunks,
-                            st.session_state.doc_source_lang,
-                            st.session_state.doc_target_lang,
-                            model,
-                            tokenizer,
-                        ):
-                            result = cumulative
-                            progress.progress(idx / len(chunks))
-                            status.write(
-                                f"Translating section {idx + 1} of {len(chunks)}"
-                            )
-                            # Re-render only on chunk boundaries; re-sending the
-                            # whole growing document every token is O(n²).
-                            if idx != last_rendered:
-                                render_output(doc_output_placeholder, result)
-                                last_rendered = idx
-                        progress.progress(1.0)
-                        status.empty()
-                        render_output(doc_output_placeholder, result)
-                        if result.strip():
-                            st.session_state.doc_output = result
-                        else:
-                            doc_warning_slot.warning(NO_OUTPUT_WARNING)
-                except Exception as e:
+    if translate_doc_clicked and uploaded is not None:
+        if st.session_state.doc_source_lang == st.session_state.doc_target_lang:
+            doc_warning_slot.warning(SAME_LANGUAGE_WARNING)
+        else:
+            result = ""
+            try:
+                with st.spinner("Reading document..."):
+                    chunks = cached_document_chunks(uploaded.getvalue())
+                if not chunks:
+                    doc_warning_slot.warning(
+                        "No translatable text found in the document."
+                    )
+                else:
+                    progress = st.progress(0.0)
+                    status = st.empty()
+                    last_rendered = -1
+                    for idx, cumulative in translate_document(
+                        chunks,
+                        st.session_state.doc_source_lang,
+                        st.session_state.doc_target_lang,
+                        model,
+                        tokenizer,
+                    ):
+                        result = cumulative
+                        progress.progress(idx / len(chunks))
+                        status.write(f"Translating section {idx + 1} of {len(chunks)}")
+                        # Re-render only on chunk boundaries; re-sending the
+                        # whole growing document every token is O(n²).
+                        if idx != last_rendered:
+                            render_output(doc_output_placeholder, result)
+                            last_rendered = idx
+                    progress.progress(1.0)
+                    status.empty()
+                    render_output(doc_output_placeholder, result)
                     if result.strip():
                         st.session_state.doc_output = result
-                        doc_warning_slot.error(
-                            f"Translation failed after partial output: {e}"
-                        )
                     else:
-                        doc_warning_slot.error(f"Translation failed: {e}")
+                        doc_warning_slot.warning(NO_OUTPUT_WARNING)
+            except Exception as e:
+                if result.strip():
+                    st.session_state.doc_output = result
+                    doc_warning_slot.error(
+                        f"Translation failed after partial output: {e}"
+                    )
+                else:
+                    doc_warning_slot.error(f"Translation failed: {e}")
 
-        # -- Download ---------------------------------------------------------
+    # -- Download -------------------------------------------------------------
 
-        st.download_button(
-            "Download",
-            key="download_doc",
-            data=st.session_state.doc_output,
-            file_name="translation.md",
-            mime="text/markdown",
-            disabled=not st.session_state.doc_output.strip(),
-            type="secondary",
-            width="stretch",
-        )
+    st.download_button(
+        "Download",
+        key="download_doc",
+        data=st.session_state.doc_output,
+        file_name="translation.md",
+        mime="text/markdown",
+        disabled=not st.session_state.doc_output.strip(),
+        type="secondary",
+        width="stretch",
+    )

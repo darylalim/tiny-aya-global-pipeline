@@ -25,8 +25,8 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install dependencies (core + docs extra + dev tools)
-        run: uv sync --extra docs
+      - name: Install dependencies (core + dev tools)
+        run: uv sync
 
       - name: Ruff format check
         run: uv run ruff format --check .

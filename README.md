@@ -17,7 +17,7 @@ Translate text and whole documents across **67 languages** entirely on your Mac.
 
 - Local inference — no API key required, nothing leaves your machine
 - 67 languages across Europe, West Asia, South Asia, Asia Pacific, and Africa
-- Translate text and documents (PDF, DOCX, PPTX, XLSX, HTML) — document support via Docling, optional
+- Translate text and documents (PDF and images) — parsed locally with LiteParse, no model weights to download
 - Side-by-side translation with streaming output
 - Cached document parsing for fast re-translation
 - Swap and download controls
@@ -38,9 +38,7 @@ Translate text and whole documents across **67 languages** entirely on your Mac.
 git clone https://github.com/darylalim/tiny-aya-translate.git
 cd tiny-aya-translate
 
-uv sync                # core: text translation only
-# or, to also translate documents (PDF, DOCX, PPTX, XLSX, HTML):
-uv sync --extra docs
+uv sync
 ```
 
 ## Usage
@@ -49,12 +47,12 @@ uv sync --extra docs
 uv run streamlit run streamlit_app.py
 ```
 
-First run downloads tiny-aya-global (~3.6 GB); document translation also downloads Docling's layout models on first use. To tune the model or sampling parameters, edit the constants at the top of `streamlit_app.py`. The app ships with a Nord theme in light and dark modes (switch via the app's settings menu); edit `.streamlit/config.toml` to restyle it.
+First run downloads tiny-aya-global (~3.6 GB); document parsing needs no additional weights. To tune the model or sampling parameters, edit the constants at the top of `streamlit_app.py`. The app ships with a Nord theme in light and dark modes (switch via the app's settings menu); edit `.streamlit/config.toml` to restyle it.
 
 ## Development
 
 ```bash
-uv sync --extra docs                                         # full test suite imports docling
+uv sync                                                      # install dependencies
 uv run pytest test_streamlit_app.py test_streamlit_ui.py -v  # run tests
 uv run ruff check --fix .                                    # lint
 uv run ruff format .                                         # format

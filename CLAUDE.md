@@ -7,7 +7,7 @@ Streamlit application for translation using Cohere Labs Tiny Aya Global on Apple
 - Python 3.13+ with uv for project management
 - Streamlit for UI
 - mlx-lm for translation inference on Apple Silicon
-- docling (optional `docs` extra) for parsing uploaded documents
+- liteparse for parsing uploaded documents (required dependency: one ~11 MB wheel with no transitive deps)
 
 ## Structure
 
@@ -19,8 +19,7 @@ Streamlit application for translation using Cohere Labs Tiny Aya Global on Apple
 ## Commands
 
 ```bash
-uv sync --extra docs                                         # install optional document support (Docling)
-uv sync --extra lite                                         # install optional document support (LiteParse)
+uv sync                                                      # install dependencies
 uv run streamlit run streamlit_app.py                        # run the app
 uv run pytest test_streamlit_app.py test_streamlit_ui.py -v  # run tests
 uv run ruff check --fix .                                    # lint
@@ -45,7 +44,7 @@ When working with Python, invoke the relevant `/astral:<skill>` for uv, ty, and 
 
 ## Conventions
 
-- Pure functions are defined above `import streamlit` with deferred imports for `mlx_lm` and `docling` inside their bodies, so tests can patch them without loading the model stack
+- Pure functions are defined above `import streamlit` with deferred imports for `mlx_lm` and `liteparse` inside their bodies, so tests can patch them without loading the model stack
 - Config is hardcoded as module-level constants (`MODEL_ID`, `DEFAULT_TEMPERATURE`, `DEFAULT_MAX_TOKENS`, `MAX_INPUT_TOKENS`, `MAX_CHUNK_TOKENS`, `DOCUMENT_TYPES`) at the top of `streamlit_app.py`, plus shared UI constants (`PANEL_HEIGHT`, `SAME_LANGUAGE_WARNING`, `NO_OUTPUT_WARNING`) reused across both tabs; source-level tests guard against re-inlining `height=450` or duplicating either warning literal
 - `streamlit_app.py` sets `TRANSFORMERS_VERBOSITY=error` via `os.environ.setdefault` at the top of the file, muting transformers' image-processor alias warnings that Streamlit's module watcher otherwise triggers on every rerun
 - Language selectboxes use the flat `LANGUAGES` list (67 items) with collapsed labels and Streamlit's built-in type-to-search; each tab's language bar is wrapped in `st.container(border=True)` as a card (Text tab: from/swap/to; Document tab: from/to)
@@ -67,16 +66,14 @@ When working with Python, invoke the relevant `/astral:<skill>` for uv, ty, and 
 - `st.set_page_config` is the first Streamlit command (right after `import streamlit as st`, before the `@st.cache_resource` decorator runs): sets `page_title`, `page_icon=":material/translate:"`, and `layout="wide"` so the side-by-side text panels get horizontal room; a source-level test asserts the title, icon, and wide layout
 - Session-state defaults are seeded with `st.session_state.setdefault(key, default)` (one line each), not `if key not in st.session_state`
 - The UI is split into `st.tabs([":material/text_fields: Text", ":material/description: Document"])`: the Text tab is the original side-by-side flow; the Document tab translates uploaded files
-- Document functions (`docling_available`, `load_document`, `chunk_document`, `translate_document`) are pure functions with deferred `docling` imports; `docling` is an optional `docs` extra, and the Document tab shows an install hint when `docling_available()` is `False`
-- `chunk_document` runs Docling's `HybridChunker`; the token budget lives on a `HuggingFaceTokenizer` (the chunker takes no `max_tokens`), and mlx-lm's `TokenizerWrapper` is unwrapped via `._tokenizer` to reach the raw HF tokenizer
-- The Document tab has **two** parser backends, chosen by the `doc_parser` radio and named by the `PARSER_DOCLING` / `PARSER_LITEPARSE` constants. Docling (`docs` extra) is model-based: ~278 packages incl. PyTorch, ~500 MB of weights, ~5.7 s cold parse. LiteParse (`lite` extra) is heuristic: one 11 MB wheel with no transitive deps, no weights, ~0.08 s cold parse. The radio lists only backends whose package imports, and the tab shows the install hint only when neither is present
-- `doc_parser` is seeded with an `if ... not in parsers` guard rather than `setdefault`, because the valid options depend on which extras are installed; the guard also resets a stored choice whose backend was later uninstalled
-- LiteParse ships **no chunker**, so `chunk_text` is the token-aware packer that replaces `HybridChunker` on that path: it splits on blank lines, packs blocks greedily under the budget, splits over-budget blocks on sentence boundaries (Latin *and* CJK enders) and finally on hard token windows, and prepends the enclosing markdown heading trail — the `contextualize` equivalent, which matters because each chunk is translated as an independent prompt
-- `chunk_text` accounting has three traps, all covered by tests: the tokenizer prepends a BOS to **every** `encode` call (so `count_tokens` subtracts `token_overhead`, or an N-block chunk is charged N BOS tokens), joining blocks costs a `\n\n` separator each, and BPE still merges across block boundaries — so `flush()` measures the assembled chunk and splits it if the estimate drifted over. Drift measures ~1 token per block, far inside the `MAX_CHUNK_TOKENS`/`MAX_INPUT_TOKENS` headroom
+- Document functions (`load_document_markdown`, `chunk_text`, `translate_document`, plus the `heading_level` / `token_overhead` / `count_tokens` / `split_oversized` helpers) are pure functions with a deferred `liteparse` import. Document support has **no** availability gate and no install hint: `liteparse` is a required dependency, one ~11 MB wheel with zero transitive deps. The project previously used Docling behind an optional `docs` extra — that extra existed only to keep Docling's ~278 packages and PyTorch out of a text-only install, and it was removed along with Docling
+- `load_document_markdown` runs LiteParse with `output_format="markdown"`, `ocr_enabled=False` (born-digital PDFs already carry a text layer) and `quiet=True` (its timing lines would otherwise print into Streamlit's stdout). It takes bytes only — LiteParse sniffs the format itself, so no filename is threaded through
+- LiteParse ships **no chunker**, so `chunk_text` is where a document becomes translatable pieces: it splits on blank lines, packs blocks greedily under the budget, splits over-budget blocks on sentence boundaries (Latin *and* CJK enders) and finally on hard token windows, and prepends the enclosing markdown heading trail — context that matters because each chunk is translated as an independent prompt
+- `chunk_text` accounting has three traps, all covered by tests: the tokenizer prepends a BOS to **every** `encode` call (so `count_tokens` subtracts `token_overhead`, or an N-block chunk is charged N BOS tokens), joining blocks costs a `\n\n` separator each, and BPE still merges across block boundaries — so `flush()` measures the assembled chunk and splits it if the estimate drifted over. Drift measures ~1 token per block, far inside the `MAX_CHUNK_TOKENS`/`MAX_INPUT_TOKENS` headroom. `SpecialTokenTokenizer` in the tests simulates the BOS and separator costs; the plain `FakeTokenizer` cannot catch this class of bug
 - The heading trail is snapshotted when a chunk *opens* (`pending`), not read at flush time — `trail` advances as blocks are consumed, so flushing against it labels a chunk with the heading of the section that comes *after* it
-- `cached_document_chunks` takes `backend` as its third argument so it is part of `@st.cache_data`'s key; switching parsers on the same upload re-parses instead of returning the other backend's chunks
-- LiteParse handles PDFs and images natively but needs LibreOffice for Office formats and cannot read HTML, so the uploader narrows to `LITE_DOCUMENT_TYPES` on that backend
-- `cached_document_chunks` (defined after `load_model`, decorated `@st.cache_data(max_entries=8, show_spinner=False)`) wraps `load_document` + `chunk_document` so re-translating the same upload skips the Docling convert+chunk; it fetches the tokenizer from `load_model()` internally rather than taking it as an arg (the tokenizer is unhashable and would defeat `@st.cache_data`'s key hashing). The Document tab calls this wrapper, not the pure functions directly; the pure functions stay for unit tests
+- `split_oversized` strips the BOS prefix before slicing token windows, or `decode` would write the special token back into the translated text
+- `DOCUMENT_TYPES` is PDF + images: those parse with no external binary, while Office formats need LibreOffice on PATH and HTML is unsupported, so neither is offered rather than accepting an upload that fails at parse time
+- `cached_document_chunks` (defined after `load_model`, decorated `@st.cache_data(max_entries=8, show_spinner=False)`) wraps `load_document_markdown` + `chunk_text` so re-translating the same upload skips the parse+chunk; the file bytes are the whole cache key. It fetches the tokenizer from `load_model()` internally rather than taking it as an arg (the tokenizer is unhashable and would defeat `@st.cache_data`'s key hashing). The Document tab calls this wrapper, not the pure functions directly; the pure functions stay for unit tests
 - `translate_document` reuses `tokenize_prompt` + `stream_translate` per chunk and yields `(chunk_index, cumulative_text)` on every token; chunks join with `\n\n`
 - `MAX_CHUNK_TOKENS` (7000) sits below `MAX_INPUT_TOKENS` to leave room for the per-chunk prompt wrapper (instruction + chat template); `translate_document` still re-checks each chunk and emits a `[Section skipped]` marker for any prompt over `MAX_INPUT_TOKENS`
 - The Document tab uses a plain `if st.button():` block (no `_do_translate` flag, no `st.rerun()`): output streams into an `st.code` placeholder, its `doc_source_lang`/`doc_target_lang` selectboxes use distinct keys to avoid widget-id collisions, and the `download_doc` button is rendered last so it picks up `st.session_state.doc_output`
