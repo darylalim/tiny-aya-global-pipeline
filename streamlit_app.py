@@ -704,22 +704,29 @@ def render_output(placeholder: Any, text: str) -> None:
 
 
 def ensure_model(warning_container: Any) -> tuple[Any, Any] | None:
-    """Load the model on demand, reporting a failure into ``warning_container``.
+    """Load the model on demand, reporting into ``warning_container``.
 
     Called from the translate handlers rather than at page load. The weights are
     ~3.6 GB, so loading them before the tabs render left the user watching a
-    spinner with nothing to type into or pick languages from. ``@st.cache_resource``
-    means the load still happens exactly once per session -- at the first
-    translation instead of at startup.
+    spinner with nothing to type into or pick languages from.
+    ``@st.cache_resource`` is process-global -- shared across every session and
+    user, not per-session -- so the load happens once per server process, at the
+    first translation rather than at startup.
+
+    The spinner is rendered into ``warning_container`` rather than at the script
+    cursor. Inside a translate handler that cursor sits below the panels and the
+    controls row, so a bare ``st.spinner`` put the only sign of activity below
+    the fold while the error landed at the top of the tab.
 
     Returns ``None`` when the load fails, having already written the error into
-    the caller's warning slot. There is no cheap way to know the model loads
-    without loading it, so the translate buttons are no longer pre-emptively
-    disabled; a broken install surfaces on click, next to the action that
-    triggered it.
+    that same slot. There is no cheap way to know the model loads without
+    loading it, so the translate buttons are no longer pre-emptively disabled; a
+    broken install surfaces on click, next to the action that triggered it.
+    ``@st.cache_resource`` does not memoize exceptions, so a later click retries
+    rather than being dead for the rest of the session.
     """
     try:
-        with st.spinner("Loading model..."):
+        with warning_container.spinner("Loading model..."):
             return load_model()
     except Exception as e:
         warning_container.error(f"Failed to load model: {e}")

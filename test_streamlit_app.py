@@ -1052,6 +1052,16 @@ def test_document_tab_calls_cache_wrapper() -> None:
     )
 
 
+def test_document_tab_loads_model_into_its_own_warning_slot() -> None:
+    # AppTest can't drive st.file_uploader, so guard this at the source level
+    # too. Two ways to get it wrong, neither of which any test would catch:
+    # passing warning_slot (the Text tab's, also in scope here) would print the
+    # load error in the wrong tab, and inverting the guard to `is None` would
+    # unpack None and raise TypeError.
+    compact = "".join(_APP_SOURCE.split())
+    assert "elif(loaded:=ensure_model(doc_warning_slot))isnotNone:" in compact
+
+
 # -- translate_document --------------------------------------------------------
 
 

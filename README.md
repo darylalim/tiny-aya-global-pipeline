@@ -47,7 +47,7 @@ uv sync
 uv run streamlit run streamlit_app.py
 ```
 
-First run downloads tiny-aya-global (~3.6 GB); document parsing needs no additional weights. To tune the model or sampling parameters, edit the constants at the top of `streamlit_app.py`. The app ships with a Nord theme in light and dark modes (switch via the app's settings menu); edit `.streamlit/config.toml` to restyle it.
+The page loads immediately; the first **Translate** click downloads tiny-aya-global (~3.6 GB) and loads it into memory, so that first translation takes a while and later ones are instant. Document parsing needs no additional weights. To tune the model or sampling parameters, edit the constants at the top of `streamlit_app.py`. The app ships with a Nord theme in light and dark modes (switch via the app's settings menu); edit `.streamlit/config.toml` to restyle it.
 
 ## Development
 

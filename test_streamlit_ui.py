@@ -14,17 +14,29 @@ def clear_st_cache() -> None:
 
 @pytest.fixture
 def app() -> AppTest:
-    """Create a patched AppTest instance with mocked model loading."""
+    """Create an AppTest instance that has completed its initial render.
+
+    The ``mlx_lm.load`` patch is belt-and-braces: the model loads lazily from
+    the translate handlers, so an initial render never reaches it (see
+    ``test_page_renders_without_loading_the_model``). Any test that goes on to
+    click Translate must re-patch -- ``_rerun_with_mocks`` or
+    ``_run_inference_test`` -- or the real loader runs and pulls 3.6 GB.
+    """
     with patch("mlx_lm.load", return_value=(MagicMock(), MagicMock())):
         at = AppTest.from_file("streamlit_app.py")
         at.run(timeout=60)
     return at
 
 
-def _rerun_with_mocks(app: AppTest) -> None:
-    """Re-run the app with mocked model loading."""
-    with patch("mlx_lm.load", return_value=(MagicMock(), MagicMock())):
+def _rerun_with_mocks(app: AppTest) -> MagicMock:
+    """Re-run the app with mocked model loading, returning the loader mock.
+
+    Callers that expect a rerun to short-circuit before the model is needed can
+    assert on the returned mock.
+    """
+    with patch("mlx_lm.load", return_value=(MagicMock(), MagicMock())) as load:
         app.run(timeout=60)
+    return load
 
 
 def _make_stream_chunk(text: str) -> MagicMock:
@@ -153,20 +165,24 @@ def test_translate_success_shows_result() -> None:
 
 def test_translate_empty_text_shows_warning(app: AppTest) -> None:
     app.button("translate").click()
-    _rerun_with_mocks(app)
+    load = _rerun_with_mocks(app)
 
     warning_values = [w.value for w in app.warning]
     assert any("Please enter some text first" in str(v) for v in warning_values)
+    # The check is free, so it must short-circuit before the weights load.
+    load.assert_not_called()
 
 
 def test_translate_same_language_shows_warning(app: AppTest) -> None:
     app.selectbox[1].set_value("English")
     app.text_area[0].set_value("Hello")
     app.button("translate").click()
-    _rerun_with_mocks(app)
+    load = _rerun_with_mocks(app)
 
     warning_values = [w.value for w in app.warning]
     assert any("two different languages" in str(v) for v in warning_values)
+    # Likewise free -- rejecting the pair must not cost a 3.6 GB load.
+    load.assert_not_called()
 
 
 # -- Language switching --------------------------------------------------------
@@ -343,13 +359,19 @@ def test_model_load_failure_shows_error_on_translate() -> None:
     assert any("Failed to load model" in str(v) for v in error_values)
 
 
-def test_translate_button_stays_enabled_when_model_load_fails() -> None:
-    # There is no cheap way to know the model loads without loading it, so the
-    # button is never pre-emptively disabled; failure surfaces on click.
+def test_translate_button_stays_enabled_after_a_failed_load() -> None:
+    # Click first, so the load actually fails before the assertion -- asserting
+    # on a fresh render would only re-test the initial state, since nothing
+    # loads the model there.
     with patch("mlx_lm.load", side_effect=RuntimeError("download failed")):
         at = AppTest.from_file("streamlit_app.py")
         at.run(timeout=60)
+        at.text_area[0].set_value("Hello")
+        at.button("translate").click()
+        at.run(timeout=60)
 
+    # A failed load must not disable the button: @st.cache_resource does not
+    # memoize the exception, so a retry works without reloading the page.
     assert not at.button("translate").disabled
 
 
