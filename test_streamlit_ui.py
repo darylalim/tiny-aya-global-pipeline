@@ -266,6 +266,28 @@ def test_translation_error_shows_message() -> None:
     assert any("Translation failed" in v and "OOM" in v for v in error_values)
 
 
+def test_tokenizer_failure_shows_message_not_traceback() -> None:
+    # apply_chat_template raises on a model whose chat template rejects this
+    # message shape -- reachable by editing MODEL_ID as the README invites.
+    # tokenize_prompt sits inside the translate try/except so this gets the same
+    # warning-slot treatment as a streaming failure, not a red traceback.
+    bad_tokenizer = MagicMock()
+    bad_tokenizer.apply_chat_template.side_effect = RuntimeError("no chat template")
+
+    with patch("mlx_lm.load", return_value=(MagicMock(), bad_tokenizer)):
+        at = AppTest.from_file("streamlit_app.py")
+        at.run(timeout=60)
+        at.text_area[0].set_value("Hello")
+        at.button("translate").click()
+        at.run(timeout=60)
+
+    assert not at.exception
+    error_values = [str(e.value) for e in at.error]
+    assert any(
+        "Translation failed" in v and "no chat template" in v for v in error_values
+    )
+
+
 def test_empty_stream_shows_warning() -> None:
     with (
         patch("mlx_lm.load", return_value=(MagicMock(), MagicMock())),

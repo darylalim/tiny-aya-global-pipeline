@@ -871,33 +871,39 @@ with text_tab:
         # A failed load has already reported itself, so the chain just ends.
         elif (loaded := ensure_model(warning_slot)) is not None:
             model, tokenizer = loaded
-            prompt_ids = tokenize_prompt(
-                current_input,
-                st.session_state.source_lang,
-                st.session_state.target_lang,
-                tokenizer,
-            )
-            n_tok = len(prompt_ids)
-            if n_tok > MAX_INPUT_TOKENS:
-                warning_slot.warning(
-                    f"Input is {n_tok} tokens — "
-                    f"please keep it under {MAX_INPUT_TOKENS}."
+            partial = ""
+            # tokenize_prompt is inside the try: apply_chat_template raises on a
+            # model whose chat template rejects this message shape, which is
+            # reachable by editing MODEL_ID as the README invites. Left outside,
+            # that surfaced as a raw Streamlit traceback while every other
+            # failure here got the warning-slot treatment.
+            try:
+                prompt_ids = tokenize_prompt(
+                    current_input,
+                    st.session_state.source_lang,
+                    st.session_state.target_lang,
+                    tokenizer,
                 )
-            else:
-                partial = ""
-                try:
+                n_tok = len(prompt_ids)
+                if n_tok > MAX_INPUT_TOKENS:
+                    warning_slot.warning(
+                        f"Input is {n_tok} tokens — "
+                        f"please keep it under {MAX_INPUT_TOKENS}."
+                    )
+                else:
                     with st.spinner("Translating..."):
                         for partial in stream_translate(prompt_ids, model, tokenizer):
                             render_output(output_placeholder, partial)
-                except Exception as e:
-                    warning_slot.error(f"Translation failed: {e}")
-                else:
                     if not partial.strip():
                         warning_slot.warning(NO_OUTPUT_WARNING)
                     else:
                         st.session_state.translate_output = partial
                         # Rerun so the disabled output picks up the final value.
+                        # RerunException extends BaseException, so the `except
+                        # Exception` below does not swallow it.
                         st.rerun()
+            except Exception as e:
+                warning_slot.error(f"Translation failed: {e}")
 
 with doc_tab:
     # -- Language bar ---------------------------------------------------------
