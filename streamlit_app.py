@@ -703,21 +703,32 @@ def render_output(placeholder: Any, text: str) -> None:
     placeholder.code(text, language=None, wrap_lines=True, height=PANEL_HEIGHT)
 
 
+def ensure_model(warning_container: Any) -> tuple[Any, Any] | None:
+    """Load the model on demand, reporting a failure into ``warning_container``.
+
+    Called from the translate handlers rather than at page load. The weights are
+    ~3.6 GB, so loading them before the tabs render left the user watching a
+    spinner with nothing to type into or pick languages from. ``@st.cache_resource``
+    means the load still happens exactly once per session -- at the first
+    translation instead of at startup.
+
+    Returns ``None`` when the load fails, having already written the error into
+    the caller's warning slot. There is no cheap way to know the model loads
+    without loading it, so the translate buttons are no longer pre-emptively
+    disabled; a broken install surfaces on click, next to the action that
+    triggered it.
+    """
+    try:
+        with st.spinner("Loading model..."):
+            return load_model()
+    except Exception as e:
+        warning_container.error(f"Failed to load model: {e}")
+        return None
+
+
 # -- Main page ----------------------------------------------------------------
 
 st.title("Tiny Aya Translate")
-
-
-# -- Model loading ------------------------------------------------------------
-
-try:
-    with st.spinner("Loading model..."):
-        model, tokenizer = load_model()
-    model_loaded = True
-except Exception as e:
-    st.error(f"Failed to load model: {e}")
-    model, tokenizer = None, None
-    model_loaded = False
 
 # -- Session state defaults ---------------------------------------------------
 
@@ -810,6 +821,13 @@ with text_tab:
 
     # -- Controls row ---------------------------------------------------------
 
+    # st.columns, not st.container(horizontal=True): the horizontal container is
+    # a flex row whose children are `flex: 1 1 fit-content`, so a stretched button
+    # grows from its *intrinsic* width rather than splitting the row evenly.
+    # Measured in-browser, that put Translate at 460.6px against Download's
+    # 465.4px -- a seam 4px off the 461/461 panels directly above, and a 14px gap
+    # against the panels' 16px. Columns are a proportional grid, which is what
+    # mirroring the panels needs.
     sub_translate, sub_download = st.columns(
         2, vertical_alignment="center", gap="small"
     )
@@ -818,7 +836,6 @@ with text_tab:
             "Translate",
             key="translate",
             on_click=request_translate,
-            disabled=not model_loaded,
             type="primary",
             width="stretch",
         )
@@ -843,34 +860,37 @@ with text_tab:
             warning_slot.warning("Please enter some text first.")
         elif st.session_state.source_lang == st.session_state.target_lang:
             warning_slot.warning(SAME_LANGUAGE_WARNING)
-        elif (
-            n_tok := len(
-                prompt_ids := tokenize_prompt(
-                    current_input,
-                    st.session_state.source_lang,
-                    st.session_state.target_lang,
-                    tokenizer,
+        # The two checks above are free, so they run before the weights load.
+        # A failed load has already reported itself, so the chain just ends.
+        elif (loaded := ensure_model(warning_slot)) is not None:
+            model, tokenizer = loaded
+            prompt_ids = tokenize_prompt(
+                current_input,
+                st.session_state.source_lang,
+                st.session_state.target_lang,
+                tokenizer,
+            )
+            n_tok = len(prompt_ids)
+            if n_tok > MAX_INPUT_TOKENS:
+                warning_slot.warning(
+                    f"Input is {n_tok} tokens — "
+                    f"please keep it under {MAX_INPUT_TOKENS}."
                 )
-            )
-        ) > MAX_INPUT_TOKENS:
-            warning_slot.warning(
-                f"Input is {n_tok} tokens — please keep it under {MAX_INPUT_TOKENS}."
-            )
-        else:
-            partial = ""
-            try:
-                with st.spinner("Translating..."):
-                    for partial in stream_translate(prompt_ids, model, tokenizer):
-                        render_output(output_placeholder, partial)
-            except Exception as e:
-                warning_slot.error(f"Translation failed: {e}")
             else:
-                if not partial.strip():
-                    warning_slot.warning(NO_OUTPUT_WARNING)
+                partial = ""
+                try:
+                    with st.spinner("Translating..."):
+                        for partial in stream_translate(prompt_ids, model, tokenizer):
+                            render_output(output_placeholder, partial)
+                except Exception as e:
+                    warning_slot.error(f"Translation failed: {e}")
                 else:
-                    st.session_state.translate_output = partial
-                    # Rerun so the disabled output picks up the final value.
-                    st.rerun()
+                    if not partial.strip():
+                        warning_slot.warning(NO_OUTPUT_WARNING)
+                    else:
+                        st.session_state.translate_output = partial
+                        # Rerun so the disabled output picks up the final value.
+                        st.rerun()
 
 with doc_tab:
     # -- Language bar ---------------------------------------------------------
@@ -902,7 +922,7 @@ with doc_tab:
     translate_doc_clicked = st.button(
         "Translate document",
         key="translate_doc",
-        disabled=not (model_loaded and uploaded is not None),
+        disabled=uploaded is None,
         type="primary",
         width="stretch",
     )
@@ -919,7 +939,9 @@ with doc_tab:
     if translate_doc_clicked and uploaded is not None:
         if st.session_state.doc_source_lang == st.session_state.doc_target_lang:
             doc_warning_slot.warning(SAME_LANGUAGE_WARNING)
-        else:
+        # A failed load has already reported itself into doc_warning_slot.
+        elif (loaded := ensure_model(doc_warning_slot)) is not None:
+            model, tokenizer = loaded
             result = ""
             try:
                 with st.spinner("Reading document..."):

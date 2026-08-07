@@ -311,24 +311,46 @@ def test_output_text_area_disabled(app: AppTest) -> None:
     assert app.text_area[1].disabled
 
 
-# -- Model load failure --------------------------------------------------------
+# -- Lazy model loading --------------------------------------------------------
 
 
-def test_model_load_failure_shows_error() -> None:
+def test_page_renders_without_loading_the_model() -> None:
+    """The UI paints before the weights are touched.
+
+    The model is loaded from the translate handlers, not at page load, so a
+    broken install still gets a full page -- tabs, language pickers, and a
+    usable input -- with no error until the user actually asks to translate.
+    """
+    with patch("mlx_lm.load", side_effect=RuntimeError("download failed")) as load:
+        at = AppTest.from_file("streamlit_app.py")
+        at.run(timeout=60)
+
+    load.assert_not_called()
+    assert len(at.tabs) == 2
+    assert len(at.text_area) == 2
+    assert not at.error
+
+
+def test_model_load_failure_shows_error_on_translate() -> None:
     with patch("mlx_lm.load", side_effect=RuntimeError("download failed")):
         at = AppTest.from_file("streamlit_app.py")
+        at.run(timeout=60)
+        at.text_area[0].set_value("Hello")
+        at.button("translate").click()
         at.run(timeout=60)
 
     error_values = [e.value for e in at.error]
     assert any("Failed to load model" in str(v) for v in error_values)
 
 
-def test_model_load_failure_disables_translate_button() -> None:
+def test_translate_button_stays_enabled_when_model_load_fails() -> None:
+    # There is no cheap way to know the model loads without loading it, so the
+    # button is never pre-emptively disabled; failure surfaces on click.
     with patch("mlx_lm.load", side_effect=RuntimeError("download failed")):
         at = AppTest.from_file("streamlit_app.py")
         at.run(timeout=60)
 
-    assert at.button("translate").disabled
+    assert not at.button("translate").disabled
 
 
 # -- Document tab --------------------------------------------------------------
