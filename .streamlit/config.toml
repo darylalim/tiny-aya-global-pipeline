@@ -1,53 +1,27 @@
-# Nord theme for Tiny Aya Translate — dual light/dark mode.
-# Arctic, north-bluish palette: Polar Night (dark) + Snow Storm (light),
-# sharing frost-blue accents. Defining both [theme.light] and [theme.dark]
-# enables the light/dark switch in Streamlit's settings menu; a single
-# [theme] section would lock the app to one mode.
+# Streamlit's own theme for Tiny Aya Translate — dual light/dark mode.
+# These are Streamlit's stock default colors, stated explicitly rather than
+# inherited: defining both [theme.light] and [theme.dark] is what surfaces the
+# light/dark switch in Streamlit's settings menu, and a lone [theme] section
+# would lock the app to one mode. Typography, radii and link underlines are
+# deliberately absent so they fall back to Streamlit's defaults (Source Sans,
+# 16px base, underlined links).
+#
+# Values are Streamlit 1.61's built-in palette, by its own scale names:
+#   red70 #ff4b4b · gray20 #f0f2f6 · gray85 #31333f
+#   gray90 #262730 · gray100 #0e1117 · gray10 #fafafa
+#   blue90 #0054a3 · blue60 #3d9df3
+# linkColor is Streamlit's resolved blueTextColor for each mode.
 
-# -- Shared across both modes (typography, shape, status palette) -------------
-[theme]
-font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
-codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
-baseFontSize = 14
-baseFontWeight = 400
-codeFontSize = "0.875rem"
-headingFontSizes = ["32px", "24px", "20px", "16px", "14px", "12px"]
-headingFontWeights = [600, 600, 600, 600, 600, 600]
-baseRadius = "4px"
-buttonRadius = "4px"
-showWidgetBorder = true
-linkUnderline = false
-# Nord Aurora — drives st.error / st.warning / st.info accents (auto-tinted per mode)
-redColor = "#bf616a"
-orangeColor = "#d08770"
-yellowColor = "#ebcb8b"
-greenColor = "#a3be8c"
-violetColor = "#b48ead"
-
-# -- Dark mode: Polar Night ---------------------------------------------------
-# primaryColor is the deep frost #4c6a93 (not the brighter #88c0d0/#5e81ac):
-# Streamlit renders primary-button labels white, and that body-size text must
-# clear WCAG AA (4.5:1) — white on #4c6a93 is 5.5:1, vs ~2:1 for #88c0d0. Light
-# mode shares the value, where it also clears 4.5:1 as link text on the light bg.
-[theme.dark]
-primaryColor = "#4c6a93"
-backgroundColor = "#2e3440"
-secondaryBackgroundColor = "#3b4252"
-textColor = "#eceff4"
-codeBackgroundColor = "#3b4252"
-codeTextColor = "#d8dee9"
-linkColor = "#81a1c1"
-borderColor = "#4c566a"
-blueColor = "#81a1c1"
-
-# -- Light mode: Snow Storm ---------------------------------------------------
 [theme.light]
-primaryColor = "#4c6a93"
-backgroundColor = "#eceff4"
-secondaryBackgroundColor = "#e5e9f0"
-textColor = "#2e3440"
-codeBackgroundColor = "#e5e9f0"
-codeTextColor = "#2e3440"
-linkColor = "#4c6a93"
-borderColor = "#d8dee9"
-blueColor = "#4c6a93"
+primaryColor = "#ff4b4b"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#31333f"
+linkColor = "#0054a3"
+
+[theme.dark]
+primaryColor = "#ff4b4b"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#262730"
+textColor = "#fafafa"
+linkColor = "#3d9df3"

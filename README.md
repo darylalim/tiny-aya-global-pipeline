@@ -11,7 +11,7 @@ Translate text and whole documents across **67 languages** entirely on your Mac.
 
 > **Note:** the model weights are licensed **CC-BY-NC (non-commercial only)** — see [License](#license).
 
-![Tiny Aya Translate — side-by-side text translation in dark Nord mode](assets/screenshot.png)
+![Tiny Aya Translate — side-by-side text translation in dark mode](assets/screenshot.png)
 
 ## Features
 
@@ -21,7 +21,7 @@ Translate text and whole documents across **67 languages** entirely on your Mac.
 - Side-by-side translation with streaming output
 - Cached document parsing for fast re-translation
 - Swap and download controls
-- Nord theme with light and dark modes
+- Streamlit's default theme with light and dark modes
 - Up to 8K tokens per input and per output
 - 8-bit quantized MLX inference on Apple Silicon
 
@@ -47,7 +47,7 @@ uv sync
 uv run streamlit run streamlit_app.py
 ```
 
-The page loads immediately; the first **Translate** click downloads tiny-aya-global (~3.6 GB) and loads it into memory, so that first translation takes a while and later ones are instant. Document parsing needs no additional weights. To tune the model or sampling parameters, edit the constants at the top of `streamlit_app.py`. The app ships with a Nord theme in light and dark modes (switch via the app's settings menu); edit `.streamlit/config.toml` to restyle it.
+The page loads immediately; the first **Translate** click downloads tiny-aya-global (~3.6 GB) and loads it into memory, so that first translation takes a while and later ones are instant. Document parsing needs no additional weights. To tune the model or sampling parameters, edit the constants at the top of `streamlit_app.py`. The app ships with Streamlit's default theme in light and dark modes (switch via the app's settings menu); edit `.streamlit/config.toml` to restyle it.
 
 ## Development
 
