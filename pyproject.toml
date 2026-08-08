@@ -10,6 +10,7 @@ dependencies = [
     "liteparse>=2.11.1",
     "mlx-lm>=0.31.3",
     "streamlit>=1.61.1",
+    "watchdog>=6.0.0",
 ]
 
 [project.urls]

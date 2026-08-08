@@ -6,6 +6,7 @@ Streamlit application for translation using Cohere Labs Tiny Aya Global on Apple
 
 - Python 3.13+ with uv for project management
 - Streamlit for UI
+- watchdog for Streamlit's file watcher, listed in `dependencies` **explicitly** because Streamlit's own requirement on it is gated `sys_platform != 'darwin'`. On macOS Streamlit therefore ships *without* it and falls back to `PollingPathWatcher`, which is what prints "For better performance, install the Watchdog module" on every launch. Streamlit's accompanying `xcode-select --install` hint is stale — the macOS wheel (`cp313-cp313-macosx_11_0_arm64`) is a compiled FSEvents binding but is **prebuilt** on PyPI, so nothing is built locally. It belongs in `dependencies` rather than the `dev` group because the server process imports it, not the tests. Confirm it took with `uv run python -c "from streamlit.watcher import path_watcher; print(path_watcher.get_default_path_watcher_class().__name__)"` → `EventBasedPathWatcher`
 - mlx-lm for translation inference on Apple Silicon
 - liteparse for parsing uploaded documents (required dependency: one ~11 MB wheel with no transitive deps)
 
