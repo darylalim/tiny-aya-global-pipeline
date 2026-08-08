@@ -11,6 +11,15 @@
 #   gray90 #262730 · gray100 #0e1117 · gray10 #fafafa
 #   blue90 #0054a3 · blue60 #3d9df3
 # linkColor is Streamlit's resolved blueTextColor for each mode.
+#
+# codeBackgroundColor is the ONE deliberate departure from stock. The Text tab
+# streams into st.code and then swaps in a settled, disabled text_area; st.code
+# is painted with codeBackgroundColor, the text_area with secondaryBackgroundColor.
+# Left unset, codeBackgroundColor falls back to Streamlit's bgMix -- a 50/50 blend
+# of the two backgrounds (#1a1c24 dark, #f8f8fa light) -- so the output panel
+# visibly changed shade the instant a translation finished. Pinning it to
+# secondaryBackgroundColor makes that handoff seamless, which is what the
+# previous Nord theme did and why the seam never showed before.
 
 [theme.light]
 primaryColor = "#ff4b4b"
@@ -18,6 +27,7 @@ backgroundColor = "#ffffff"
 secondaryBackgroundColor = "#f0f2f6"
 textColor = "#31333f"
 linkColor = "#0054a3"
+codeBackgroundColor = "#f0f2f6"
 
 [theme.dark]
 primaryColor = "#ff4b4b"
@@ -25,3 +35,4 @@ backgroundColor = "#0e1117"
 secondaryBackgroundColor = "#262730"
 textColor = "#fafafa"
 linkColor = "#3d9df3"
+codeBackgroundColor = "#262730"

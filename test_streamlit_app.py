@@ -124,7 +124,7 @@ def _contrast_ratio(hex_a: str, hex_b: str) -> float:
     return (lighter + 0.05) / (darker + 0.05)
 
 
-def test_primary_button_text_readable_in_both_modes() -> None:
+def test_primary_button_contrast_does_not_regress() -> None:
     # Streamlit renders primary-button labels white, so this measures label
     # against button fill — text contrast, WCAG AA 4.5:1 (SC 1.4.3). The theme
     # uses Streamlit's stock brand red #ff4b4b, which is 3.30:1, so the app
