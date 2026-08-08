@@ -30,7 +30,8 @@ uv run ty check                                              # type check
 When working with Python, invoke the relevant `/astral:<skill>` for uv, ty, and ruff to ensure best practices are followed.
 
 - Bare `python` is **not** on `PATH` (`command not found: python`); everything goes through `uv run`, one-off scripts included (`uv run python <script>`)
-- `uv run streamlit docs st.<command>` prints the exact signature and docstring from the *installed* Streamlit — use it instead of recalling an API from memory. The `developing-with-streamlit` skill routes to version-matched reference docs bundled inside the venv at `.venv/lib/python3.13/site-packages/streamlit/.agents/skills/`, not to anything in this repo
+- `uv run streamlit docs st.<command>` prints the exact signature and docstring from the *installed* Streamlit — use it instead of recalling an API from memory. The `developing-with-streamlit` skill routes to version-matched reference docs bundled inside the venv at `.venv/lib/python3.13/site-packages/streamlit/.agents/skills/`, not to anything in this repo; that tree also carries ready-made theme configs under `assets/templates/themes/configs/` (12 presets, `nord.toml` among them)
+- A throwaway `uv run python -c` that **imports** `test_streamlit_app` or `streamlit_app` buries its output under dozens of `missing ScriptRunContext!` warnings, because importing the app runs Streamlit calls outside a script run. For a quick calculation, inline the few lines you need rather than importing the module
 
 ## Automation
 
@@ -48,6 +49,19 @@ When working with Python, invoke the relevant `/astral:<skill>` for uv, ty, and 
 - Every `${{ }}` value is passed through a step-level `env:` block rather than inlined into a `run:` script — the standard defense against workflow command injection. `github.ref_name` is a branch name and must never be inlined
 - `main` has no branch protection or rulesets, which is what lets the workflow push the bump commit directly. Adding protection means allowlisting the Actions actor
 - Manual fallback, if the workflow is ever bypassed: bump → commit `pyproject.toml` + `uv.lock` together → `git tag -a vX.Y.Z` → `git push origin vX.Y.Z`. Tags must be pushed explicitly; a branch push (including via GitHub Desktop) does not carry them — verify with `git ls-remote --tags origin`
+
+## Screenshots
+
+`assets/screenshot.png` is the README hero image: the Text tab in dark mode, English → French, `hello world` → `Bonjour le monde`. Regenerate it whenever the theme or that tab's layout changes. It is **binary, so nothing in CI can catch it going stale** — it silently advertised the removed Nord theme until pixels were sampled and colour-managed. Every trap below produces a plausible-looking but wrong image, which is why they are worth writing down.
+
+- Serve it on a **free port**: `uv run streamlit run streamlit_app.py --server.port 8502 --server.headless true`. 8501 on this machine is usually another project's app, and Streamlit will happily start on a different port without saying so loudly
+- The shot needs a **real translation**, not an empty app. The output `text_area` is `disabled=True` and Streamlit renders disabled content muted grey, so genuine output *looks like* placeholder text — the actual placeholder is the word `Translation`. Weights are already in `~/.cache/huggingface` (~3.3 GB), so the Translate click costs seconds rather than a download
+- **Move the pointer off the button before capturing.** Clicking Translate leaves the cursor hovering it, and Streamlit's primary hover is `rgb(255,0,0)` against the resting `rgb(255,75,75)`; a baked-in hover state reads as a deliberate colour choice, not a mistake. Verify with `getComputedStyle(btn).backgroundColor`, not by eye
+- Hide the Streamlit toolbar (`[data-testid="stToolbar"]`, plus `stDecoration`/`stStatusWidget`) by setting `display:none` from the page, and **re-hide after every rerun** — a translation rebuilds the DOM and brings it back
+- macOS `screencapture` **does not work from this environment** — `could not create image from rect` for every region *and* every `-D` display, because the process has no Screen Recording permission and only the user can grant it. Do not burn time debugging the rect; use the Chrome extension
+- The Chrome `computer` **`screenshot`** action downsamples (a 1080px-wide viewport returns 883px), while the **`zoom`** action re-renders its region at *native* resolution. `zoom`'s `region` is expressed in the **downsampled screenshot's** coordinate space, not viewport space — scale viewport coords by the downsample factor first. Out-of-range values fail with a message that misleadingly quotes the viewport size, which sends you looking in the wrong place
+- Chrome embeds a `Google/Skia/…` display profile, so **captured pixels are not sRGB** — the page background reads `#101216` against the configured `#0e1117`. Convert with `PIL.ImageCms.profileToProfile(img, src, ImageCms.createProfile("sRGB"))` before saving. Neutrals then land byte-exact; a saturated primary clips ~4% (`#ff4b4b` → `#f54b4c`) **identically under all four rendering intents**, so that residue is the floor of the round trip and not an intent left to tune
+- Sample the *fill*, not the centre, when spot-checking a button — dead centre is the label glyph, and white-on-red anti-aliasing returns a pink that looks like a colour bug
 
 ## Conventions
 
