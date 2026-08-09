@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "command -v jq >/dev/null 2>&1 || { echo \"protected-paths hook: jq not found — refusing edit (fail-closed).\" >&2; exit 2; }; f=$(jq -r '.tool_input.file_path // empty'); [ -z \"$f\" ] && { echo \"protected-paths hook: no file_path in tool input — refusing (fail-closed).\" >&2; exit 2; }; fl=$(printf '%s' \"$f\" | tr 'A-Z' 'a-z'); case \"$fl\" in */uv.lock|uv.lock|*/.streamlit/secrets.toml|.streamlit/secrets.toml) echo \"Blocked: $f is protected — uv.lock changes only via uv; secrets must never be edited here.\" >&2; exit 2;; esac; exit 0",
+            "command": "input=$(cat); command -v jq >/dev/null 2>&1 || { echo \"protected-paths hook: jq not found — refusing edit (fail-closed).\" >&2; exit 2; }; f=$(printf '%s' \"$input\" | jq -r '.tool_input.file_path // empty'); [ -z \"$f\" ] && { echo \"protected-paths hook: no file_path in tool input — refusing (fail-closed).\" >&2; exit 2; }; fl=$(printf '%s' \"$f\" | tr 'A-Z' 'a-z'); case \"$fl\" in */uv.lock|uv.lock|*/.streamlit/secrets.toml|.streamlit/secrets.toml) echo \"Blocked: $f is protected — uv.lock changes only via uv; secrets must never be edited here.\" >&2; exit 2;; esac; case \"$fl\" in */pyproject.toml|pyproject.toml) printf '%s' \"$input\" | jq -r '.tool_input.new_string // .tool_input.content // empty' | grep -qE '^[[:space:]]*version[[:space:]]*=' && { echo \"Blocked: hand-editing version in $f leaves uv.lock stale and fails 'uv sync --locked' in CI. Use 'uv version --bump <patch|minor|major>', which rewrites both files.\" >&2; exit 2; };; esac; exit 0",
             "timeout": 10,
             "statusMessage": "checking protected paths"
           }
@@ -19,9 +19,15 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" && uv run ruff check --fix . && uv run ruff format .",
+            "command": "f=$(jq -r '.tool_input.file_path // empty' 2>/dev/null); case \"$f\" in *.py) ;; *) exit 0;; esac; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; uv run ruff check --fix .; rc=$?; uv run ruff format .; exit $rc",
             "timeout": 60,
             "statusMessage": "ruff: lint-fix + format"
+          },
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // empty' 2>/dev/null); case \"$f\" in */.github/workflows/*.yml|*/.github/workflows/*.yaml) ;; *) exit 0;; esac; command -v actionlint >/dev/null 2>&1 || exit 0; actionlint \"$f\" >&2 || exit 2",
+            "timeout": 30,
+            "statusMessage": "actionlint"
           }
         ]
       }

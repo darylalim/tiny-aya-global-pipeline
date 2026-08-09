@@ -17,7 +17,7 @@ Streamlit application for translation using Cohere Labs Tiny Aya Global on Apple
 - `test_streamlit_ui.py` — pytest UI tests for Streamlit interface
 - `.streamlit/config.toml` — Streamlit's default theme, light and dark modes
 - `.github/workflows/` — `ci.yml` (checks + auto-publish release) and `release.yml` (manual bump), sharing `.github/scripts/release-notes.sh`; see Automation and Releases
-- `.claude/settings.json` — ruff/ty/pytest hooks and the protected-path guard; see Automation
+- `.claude/settings.json` — ruff/actionlint/ty/pytest hooks and the protected-path guard; see Automation
 - `assets/screenshot.png` — README hero image; see Screenshots
 
 ## Commands
@@ -42,7 +42,11 @@ When working with Python, invoke the relevant `/astral:<skill>` for uv, ty, and 
 - CI (`.github/workflows/ci.yml`) has **two jobs**. `check` runs on `macos-latest` (Apple Silicon, so `mlx-lm` installs natively) for pushes to `main` and PRs: `uv sync --locked`, `ruff format --check .`, `ruff check .`, `ty check`, then `pytest test_streamlit_app.py test_streamlit_ui.py -q`. Note `--check` — unformatted code fails CI rather than being auto-fixed. `release` is the auto-publish job described under Releases
 - The sync is `uv sync --locked`, not a bare `uv sync`. `uv.lock` records the project's own version, so a hand bump that edits `pyproject.toml` alone leaves the lock stale — and a bare `uv sync` **rewrites it in place and goes green**, which would let the `release` job tag a commit whose lock disagrees with its pyproject. `--locked` fails the run instead. The same swap was made in `release.yml`, which claims "same gate as ci.yml" and now actually is
 - `concurrency` is declared **per job**, not at workflow level. A workflow-level `cancel-in-progress: true` cancels the *whole run*, so a second push landing during a release could kill the job between `git push --tags` and `gh release create`, leaving a pushed tag with no release. `check` keeps `ci-${{ github.ref }}` / cancel-in-progress; `release` takes `group: release` / **no** cancel, the same group `release.yml` uses, so the two release paths serialize against each other repo-wide
-- `.claude/settings.json` hooks: `PostToolUse` runs `ruff check --fix . && ruff format .` after every Edit/Write (edited files may be reformatted underneath you), `Stop` runs `ty check` + `pytest` at session end, and a fail-closed `PreToolUse` hook blocks edits to `uv.lock` and `.streamlit/secrets.toml`
+- `.claude/settings.json` carries **four** hooks, and three of them encode a trap worth knowing:
+  - `PostToolUse` → **ruff** on `*.py` edits only (whole project, so edited files may be reformatted underneath you). The two commands are deliberately **not** chained with `&&`: `ruff check --fix` exits 1 whenever unfixable violations remain, which skipped `ruff format` on precisely the files that needed it — verified by reproduction, an unformatted `x    =   undefined_name` survived the chain untouched. It runs `check --fix .; rc=$?; format .; exit $rc`, so formatting always happens and the lint status still propagates
+  - `PostToolUse` → **actionlint** on `.github/workflows/*.y{,a}ml` edits, `exit 2` on findings. It redirects **stdout to stderr** (`actionlint "$f" >&2`) because actionlint reports on stdout (measured: 583 bytes stdout, 0 stderr) while Claude Code surfaces only *stderr* on `exit 2` — without the redirect a broken workflow fired the hook correctly and reported nothing
+  - `Stop` → `ty check` + `pytest`, unconditional. It runs on docs-only sessions too; that is the accepted price of not letting a heuristic skip the run that mattered
+  - `PreToolUse` → the fail-closed guard. Blocks edits to `uv.lock` and `.streamlit/secrets.toml`, and blocks hand-editing `version` in `pyproject.toml` (use `uv version --bump`, which rewrites the lock as well). It reads stdin **once** into a variable — `jq` consumes stdin, so the second query for `.tool_input.new_string` would otherwise return empty and the guard would silently pass everything. Its version regex is anchored (`^[[:space:]]*version[[:space:]]*=`) so `target-version = "py313"` under `[tool.ruff]` stays editable; without the anchor no ruff config change would be possible
 
 ## Releases
 
