@@ -25,7 +25,7 @@ Streamlit application for translation using Cohere Labs Tiny Aya Global on Apple
 ```bash
 uv sync                                                      # install dependencies
 uv run streamlit run streamlit_app.py                        # run the app
-uv run pytest test_streamlit_app.py test_streamlit_ui.py -v  # run tests
+uv run pytest -v                                             # run tests
 uv run ruff check --fix .                                    # lint
 uv run ruff format .                                         # format
 uv run ty check                                              # type check
@@ -39,7 +39,11 @@ When working with Python, invoke the relevant `/astral:<skill>` for uv, ty, and 
 
 ## Automation
 
-- CI (`.github/workflows/ci.yml`) has **two jobs**. `check` runs on `macos-latest` (Apple Silicon, so `mlx-lm` installs natively) for pushes to `main` and PRs: `uv sync --locked`, `ruff format --check .`, `ruff check .`, `ty check`, then `pytest test_streamlit_app.py test_streamlit_ui.py -q`. Note `--check` — unformatted code fails CI rather than being auto-fixed. `release` is the auto-publish job described under Releases
+- CI (`.github/workflows/ci.yml`) has **two jobs**. `check` runs on `macos-latest` (Apple Silicon, so `mlx-lm` installs natively) for pushes to `main` and PRs: `uv sync --locked`, `ruff format --check .`, `ruff check .`, `ty check`, then `pytest -q`. Note `--check` — unformatted code fails CI rather than being auto-fixed. `release` is the auto-publish job described under Releases
+- The test step is **bare `pytest`**, not the hand-listed pair it used to be. `pyproject.toml` sets `testpaths = ["."]`, so collection follows the repo — naming the two files meant a third test module could be added to a green CI that never ran it, and the same list was duplicated in the `Stop` hook, `release.yml`, and both READMEs. Confirmed identical coverage: 154 tests collected either way
+- Both jobs carry **`timeout-minutes`** (30 on the macOS `check`, 10 on the ubuntu `release`; `release.yml` also 30). GitHub's default is **6 hours**, and macOS bills at 10x — so an unguarded wedged run costs ~3,600 billed minutes. This is the same cost concern that put the `release` job on ubuntu, applied at the point of largest exposure
+- `.python-version` is **tracked, deliberately** — it is the only thing pinning CI's interpreter. It was previously gitignored alongside `.env`/`.venv/`, so a fresh clone (which is every CI run) left uv with nothing but `requires-python = ">=3.13"` and it resolved the newest match; CI would have silently moved to 3.14 on release day. It also makes README's "uv installs a matching interpreter from `.python-version`" true, which it was not while the file was untracked
+- Actions are pinned to `actions/checkout@v7` and `astral-sh/setup-uv@v9`, bumped from v4/v5 in August 2026. Checked before bumping: checkout v5-v7 are node24, a credentials-file change, and a fork-PR block that only affects `pull_request_target`/`workflow_run` (neither used here); setup-uv v7-v8 are node24 plus internal removals. **setup-uv v9 deliberately increases Actions cache usage** — flagged as breaking by upstream for that reason, so watch cache storage if it ever matters
 - The sync is `uv sync --locked`, not a bare `uv sync`. `uv.lock` records the project's own version, so a hand bump that edits `pyproject.toml` alone leaves the lock stale — and a bare `uv sync` **rewrites it in place and goes green**, which would let the `release` job tag a commit whose lock disagrees with its pyproject. `--locked` fails the run instead. The same swap was made in `release.yml`, which claims "same gate as ci.yml" and now actually is
 - `concurrency` is declared **per job**, not at workflow level. A workflow-level `cancel-in-progress: true` cancels the *whole run*, so a second push landing during a release could kill the job between `git push --tags` and `gh release create`, leaving a pushed tag with no release. `check` keeps `ci-${{ github.ref }}` / cancel-in-progress; `release` takes `group: release` / **no** cancel, the same group `release.yml` uses, so the two release paths serialize against each other repo-wide
 - `.claude/settings.json` carries **four** hooks, and three of them encode a trap worth knowing:

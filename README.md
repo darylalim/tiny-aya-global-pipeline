@@ -53,7 +53,7 @@ The page loads immediately; the first **Translate** click downloads tiny-aya-glo
 
 ```bash
 uv sync                                                      # install dependencies
-uv run pytest test_streamlit_app.py test_streamlit_ui.py -v  # run tests
+uv run pytest -v                                             # run tests
 uv run ruff check --fix .                                    # lint
 uv run ruff format .                                         # format
 uv run ty check                                              # type check

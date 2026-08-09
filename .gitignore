@@ -1,7 +1,10 @@
 # Environment
 .env
 .venv/
-.python-version
+# .python-version is deliberately NOT ignored -- it is the only thing pinning
+# CI's interpreter. Without it in the repo, a fresh clone gives uv nothing but
+# requires-python = ">=3.13", so CI resolves the newest matching Python and
+# silently drifts onto a version never run locally.
 
 # Python
 __pycache__/

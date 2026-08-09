@@ -32,13 +32,16 @@ jobs:
   release:
     # Same runner as ci.yml: mlx-lm installs natively on Apple Silicon.
     runs-on: macos-latest
+    # Same reasoning as ci.yml's check job -- 6-hour default against 10x billing.
+    # This path also pushes a commit and a tag, so a hang is worth cutting short.
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # changelog needs full history and tags
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v9
         with:
           enable-cache: true
 
@@ -58,7 +61,7 @@ jobs:
         run: uv run ty check
 
       - name: Tests
-        run: uv run pytest test_streamlit_app.py test_streamlit_ui.py -q
+        run: uv run pytest -q
 
       # `uv version --bump` rewrites pyproject.toml *and* re-locks uv.lock, which
       # records the project's own version. Bumping only pyproject leaves the lock

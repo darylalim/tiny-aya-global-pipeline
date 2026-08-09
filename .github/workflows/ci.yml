@@ -14,6 +14,10 @@ jobs:
   check:
     # Apple Silicon runner: mlx-lm installs natively, matching the app's runtime.
     runs-on: macos-latest
+    # GitHub's default job timeout is 6 hours and macOS bills at 10x, so a wedged
+    # sync or a hung test would burn ~3,600 billed minutes before being killed.
+    # A full cold run here is minutes, not tens of minutes.
+    timeout-minutes: 30
     # Scoped to this job rather than the whole workflow, so a rapid second push
     # cannot cancel a release job that is already mid tag-push. A superseded run
     # still stops here, and its release job is skipped along with it.
@@ -21,10 +25,10 @@ jobs:
       group: ci-${{ github.ref }}
       cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v9
         with:
           enable-cache: true
 
@@ -45,8 +49,11 @@ jobs:
       - name: Type check
         run: uv run ty check
 
+      # Bare `pytest`, not a hand-listed pair of files: pyproject sets
+      # testpaths = ["."], so collection follows the repo. Naming the files meant
+      # a third test module would be added to a green CI that never ran it.
       - name: Tests
-        run: uv run pytest test_streamlit_app.py test_streamlit_ui.py -q
+        run: uv run pytest -q
 
   # Publishes a GitHub Release whenever a version bump lands on main. This is the
   # hand-bump path; release.yml remains the button-driven one, and the two
@@ -59,6 +66,9 @@ jobs:
     # Plain git + gh, so there is no reason to pay for the 10x-billed macOS
     # runner the checks need for mlx-lm.
     runs-on: ubuntu-latest
+    # Everything here is git and gh against the API; a run that has not finished
+    # in ten minutes is stuck, not slow.
+    timeout-minutes: 10
     # Overrides the workflow default above; needed to push the tag and to create
     # the release.
     permissions:
@@ -70,7 +80,7 @@ jobs:
       group: release
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # changelog needs full history and tags
 

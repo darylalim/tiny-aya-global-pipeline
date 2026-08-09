@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" && uv run ty check && uv run pytest test_streamlit_app.py test_streamlit_ui.py -q",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && uv run ty check && uv run pytest -q",
             "timeout": 180,
             "statusMessage": "ty check + pytest"
           }
