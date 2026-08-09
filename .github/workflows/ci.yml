@@ -48,7 +48,7 @@ jobs:
       - name: Tests
         run: uv run pytest test_streamlit_app.py test_streamlit_ui.py -q
 
-  # Drafts a GitHub Release whenever a version bump lands on main. This is the
+  # Publishes a GitHub Release whenever a version bump lands on main. This is the
   # hand-bump path; release.yml remains the button-driven one, and the two
   # cannot collide -- see the gate step below.
   release:
@@ -63,7 +63,7 @@ jobs:
     # the release.
     permissions:
       contents: write
-    # Shares release.yml's group, so a dispatched release and an auto-draft can
+    # Shares release.yml's group, so a dispatched release and an auto-publish can
     # never interleave. Never cancelled: a half-finished run leaves a pushed tag
     # with no release attached to it.
     concurrency:
@@ -94,7 +94,7 @@ jobs:
             echo "v${version} is already tagged - nothing to release." >> "$GITHUB_STEP_SUMMARY"
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
-            echo "v${version} has no tag - drafting a release." >> "$GITHUB_STEP_SUMMARY"
+            echo "v${version} has no tag - publishing a release." >> "$GITHUB_STEP_SUMMARY"
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -118,16 +118,26 @@ jobs:
           git tag -a "v${VERSION}" -m "v${VERSION}"
           git push origin "refs/tags/v${VERSION}"
 
-      # Draft, not published: the generated sections are the part that must stay
-      # true, but the Highlights/Requirements/Run blurb can only be written by
-      # hand. Edit the draft, then publish.
-      - name: Create draft release
+      # Published, not drafted: a version bump reaching main is the decision to
+      # ship, so there is no second confirmation. The consequence is that the
+      # generated sections ARE the release notes -- commit subjects since the
+      # last tag are user-facing copy now, and a sloppy `fix:` line ships as one.
+      #
+      # `--verify-tag` is not redundant with the push above. Without it, `gh`
+      # creates a missing tag itself from the default branch's HEAD, so a tag
+      # push that silently failed would yield a release quietly attached to a
+      # different commit. With it, the step aborts and the tag/release pair
+      # stays consistent. `--latest` is left unset, which means GitHub decides
+      # from date and version rather than defaulting to true -- the right call
+      # while the newest release is always the highest version.
+      - name: Publish release
         if: steps.gate.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.gate.outputs.version }}
         run: |
-          gh release create "v${VERSION}" \
-            --draft \
+          url="$(gh release create "v${VERSION}" \
+            --verify-tag \
             --title "v${VERSION}" \
-            --notes-file "$RUNNER_TEMP/notes.md"
+            --notes-file "$RUNNER_TEMP/notes.md")"
+          echo "Published [v${VERSION}](${url})" >> "$GITHUB_STEP_SUMMARY"

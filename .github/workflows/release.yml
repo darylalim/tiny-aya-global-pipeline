@@ -4,7 +4,7 @@ name: Release
 # A tag pushed with GITHUB_TOKEN does not trigger other workflows, so an
 # `on: push: tags:` release job would silently never fire.
 #
-# ci.yml drafts a release for any version bump that lands on main, which makes
+# ci.yml publishes a release for any version bump that lands on main, which makes
 # this the second of two release paths. They do not collide, for the same reason
 # stated above: the bump commit below is pushed with GITHUB_TOKEN, so it does not
 # start a CI run at all -- and even if it did, ci.yml skips any version that is
@@ -97,15 +97,22 @@ jobs:
           git tag -a "v${VERSION}" -m "v${VERSION}"
           git push origin "HEAD:${REF}" "refs/tags/v${VERSION}"
 
-      # Draft, not published: the generated sections are the part that must stay
-      # true, but the Highlights/Requirements/Run blurb can only be written by
-      # hand. Edit the draft, then publish.
-      - name: Create draft release
+      # Published, not drafted, matching ci.yml -- neither path stops for review,
+      # so the generated sections ARE the release notes. Kept identical to the
+      # step in ci.yml on purpose: the two paths already share release-notes.sh
+      # so they cannot describe the same commits differently, and a difference in
+      # how the notes are *shipped* would reintroduce exactly that drift.
+      #
+      # `--verify-tag` guards the same failure as there: `gh` would otherwise
+      # create a missing tag from the default branch's HEAD, attaching the
+      # release to a commit other than the bump this workflow just pushed.
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
-          gh release create "v${VERSION}" \
-            --draft \
+          url="$(gh release create "v${VERSION}" \
+            --verify-tag \
             --title "v${VERSION}" \
-            --notes-file "$RUNNER_TEMP/notes.md"
+            --notes-file "$RUNNER_TEMP/notes.md")"
+          echo "Published [v${VERSION}](${url})" >> "$GITHUB_STEP_SUMMARY"

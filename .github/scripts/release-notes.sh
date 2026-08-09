@@ -2,9 +2,12 @@
 # Build GitHub Release notes from the conventional commits since the previous
 # tag, writing them to the path given as $1.
 #
-# Shared by both release paths -- ci.yml's auto-draft job and release.yml's
+# Shared by both release paths -- ci.yml's auto-publish job and release.yml's
 # dispatch job -- so the two can never drift into describing the same commits
 # differently.
+#
+# Neither path drafts, so this output ships to users unreviewed: the commit
+# subjects it collects are the release notes, not a starting point for them.
 #
 # Runs on both ubuntu-latest and macos-latest, and macOS ships bash 3.2, so
 # nothing here may use bash 4 syntax (no arrays, no `${x,,}`).
