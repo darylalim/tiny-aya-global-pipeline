@@ -15,6 +15,7 @@ from streamlit_app import (
     count_tokens,
     document_download_name,
     document_meta_line,
+    escape_markdown,
     hard_windows,
     heading_level,
     heading_line,
@@ -1063,14 +1064,16 @@ def test_document_tab_calls_cache_wrapper() -> None:
     )
 
 
-def test_document_tab_loads_model_into_its_own_warning_slot() -> None:
+def test_document_tab_loads_model_into_its_own_status_slot() -> None:
     # AppTest can't drive st.file_uploader, so guard this at the source level
-    # too. Two ways to get it wrong, neither of which any test would catch:
+    # too. Three ways to get it wrong, none of which any test would catch:
     # passing warning_slot (the Text tab's, also in scope here) would print the
-    # load error in the wrong tab, and inverting the guard to `is None` would
-    # unpack None and raise TypeError.
+    # load error in the wrong tab; inverting the guard to `is None` would
+    # unpack None and raise TypeError; and doc_warning_slot -- the previous
+    # value -- put the tab's longest-running activity indicator in the slot
+    # reserved for warnings and errors.
     compact = "".join(_APP_SOURCE.split())
-    assert "elif(loaded:=ensure_model(doc_warning_slot))isnotNone:" in compact
+    assert "elif(loaded:=ensure_model(doc_status_slot))isnotNone:" in compact
 
 
 # -- translate_document --------------------------------------------------------
@@ -1205,9 +1208,44 @@ def test_render_output_is_single_code_sink() -> None:
 
 
 def test_document_meta_line_names_file_and_direction() -> None:
+    # The filename is escaped because st.caption renders Markdown; the escapes
+    # are not displayed. Language names are plain letters and pass through.
     assert (
         document_meta_line("report.pdf", "English", "French")
-        == "report.pdf \u00b7 English \u2192 French"
+        == "report\\.pdf \u00b7 English \u2192 French"
+    )
+
+
+def test_document_meta_line_escapes_markdown_in_the_filename() -> None:
+    # Unescaped, *draft*.pdf renders as italic "draft.pdf" and a bracket-paren
+    # name renders as a live link -- in the caption whose job is to state the
+    # filename accurately.
+    assert document_meta_line("*draft*.pdf", "English", "French").startswith(
+        "\\*draft\\*\\.pdf"
+    )
+    assert "](" not in document_meta_line(
+        "[r](https://example.com).pdf", "English", "French"
+    )
+
+
+def test_document_download_name_strips_header_breaking_characters() -> None:
+    # Streamlit builds Content-Disposition as f'filename="{filename}"' with no
+    # quoting, so a double quote in an upload name truncates the saved file.
+    assert document_download_name('re"port.pdf', "French") == "re_port-French.md"
+    assert document_download_name("a/b.pdf", "French") == "a_b-French.md"
+    assert document_download_name("x\nnew.pdf", "French") == "x_new-French.md"
+
+
+def test_document_download_name_keeps_non_ascii() -> None:
+    # Nothing to strip either way, but the two names take DIFFERENT branches:
+    # Streamlit selects on filename.encode("latin1"), not on ASCII. Bokmal
+    # encodes to latin1 and goes down the quoted branch as a raw byte; the CJK
+    # name raises UnicodeEncodeError and takes filename*=utf-8''.
+    assert document_download_name("rapport.pdf", "Bokm\u00e5l") == (
+        "rapport-Bokm\u00e5l.md"
+    )
+    assert document_download_name("\u5831\u544a.pdf", "French") == (
+        "\u5831\u544a-French.md"
     )
 
 
@@ -1234,5 +1272,42 @@ def test_text_download_button_uses_the_recorded_name() -> None:
     # a media-manager url), so guard the wiring here: the Text tab must read
     # the captured name, never re-inline the old constant.
     assert "file_name=st.session_state.download_name," in _APP_SOURCE
-    assert '"translation.txt"' in _APP_SOURCE  # the reset default only
-    assert _APP_SOURCE.count('file_name="translation.txt"') == 0
+    # Each default name is written exactly once, at its constant. Three reset
+    # paths used to inline "translation.txt" and two inlined "translation.md",
+    # so changing one left the others behind with nothing failing.
+    assert _APP_SOURCE.count('"translation.txt"') == 1
+    assert _APP_SOURCE.count('"translation.md"') == 1
+    assert "DEFAULT_TEXT_DOWNLOAD" in _APP_SOURCE
+    assert "DEFAULT_DOC_DOWNLOAD" in _APP_SOURCE
+
+
+def test_escape_markdown_leaves_plain_text_alone() -> None:
+    assert escape_markdown("report pdf") == "report pdf"
+
+
+def test_escape_markdown_neutralises_streamlit_markup() -> None:
+    # Asserted by OUTCOME, not by re-listing the regex's own character class --
+    # the previous version looped the identical literals the pattern is built
+    # from, so it could not fail while advertising "every metacharacter".
+    # st.caption renders more than CommonMark: LaTeX, emoji shortcodes and HTML
+    # entities all need neutralising too.
+    for raw, must_not_contain in [
+        ("*draft*.pdf", "*draft*"),
+        ("[r](https://example.com).pdf", "]("),
+        ("budget $100 vs $200.pdf", "$100 vs $200"),
+        ("photo:sunglasses:.pdf", ":sunglasses:"),
+        ("AT&amp;T.pdf", "&amp;"),
+    ]:
+        assert must_not_contain not in escape_markdown(raw), raw
+    # A leading "#" would render as a heading; it must carry its backslash.
+    assert escape_markdown("# heading.pdf").startswith("\\#")
+
+
+def test_escape_markdown_covers_all_ascii_punctuation() -> None:
+    # CommonMark permits a backslash before any ASCII punctuation, and renders
+    # it as the bare character -- so over-escaping is free and under-escaping
+    # is the only failure mode.
+    import string
+
+    for ch in string.punctuation:
+        assert escape_markdown(ch) == "\\" + ch

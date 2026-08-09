@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -136,8 +137,11 @@ def test_swap_moves_output_to_input() -> None:
 
 
 def test_input_placeholder_names_the_character_cap(app: AppTest) -> None:
-    # max_chars reaches the browser as HTML maxlength and truncates silently,
-    # so the placeholder is the only place the cap can announce itself.
+    # max_chars reaches the browser as HTML maxlength and truncates a long
+    # paste silently, so the placeholder is its only surface. Measured with the
+    # model's own tokenizer, 30,000 characters of English is ~5,756 tokens --
+    # inside MAX_INPUT_TOKENS -- so for Latin scripts this really is the limit
+    # a user hits. The token gate announces itself separately, with its count.
     assert "30,000" in app.text_area[0].placeholder
 
 
@@ -560,3 +564,98 @@ def test_download_buttons_do_not_trigger_a_rerun(app: AppTest) -> None:
     # so every click re-executed both tab bodies to rebuild an identical page.
     for button in app.get("download_button"):
         assert button.ignore_rerun  # ty: ignore[unresolved-attribute]
+
+
+# -- Stale state after a failed or empty translation ---------------------------
+
+
+def _translate_with(at: AppTest, text: str, **stream_kwargs: Any) -> AppTest:
+    """Type ``text`` and click Translate with mlx_lm patched."""
+    with (
+        patch("mlx_lm.load", return_value=(MagicMock(), MagicMock())),
+        patch("mlx_lm.stream_generate", **stream_kwargs),
+    ):
+        at.text_area[0].set_value(text)
+        at.button("translate").click()
+        at.run(timeout=60)
+    return at
+
+
+def test_empty_result_does_not_leave_the_previous_translation_downloadable() -> None:
+    # The regression this guards: a `finally` restored translate_output to
+    # clear the skeleton, so "the model returned an empty translation" rendered
+    # above a live, downloadable translation of *different* input.
+    at = _run_inference_test(input_text="hello world", chunk_text="Bonjour le monde")
+    assert at.session_state["translate_output"] == "Bonjour le monde"
+
+    _translate_with(at, "a completely different sentence", return_value=iter([]))
+
+    assert any("empty translation" in str(w.value) for w in at.warning)
+    assert not at.get("code")
+    assert at.session_state["translate_output"] == ""
+    assert at.get("download_button")[0].disabled  # ty: ignore[unresolved-attribute]
+    assert at.session_state["download_name"] == "translation.txt"
+
+
+def test_failure_without_output_does_not_leave_a_stale_download() -> None:
+    # Same rule as the empty path: state has to agree with the message.
+    at = _run_inference_test(input_text="hello world", chunk_text="Bonjour le monde")
+
+    _translate_with(at, "goodbye", side_effect=RuntimeError("OOM"))
+
+    assert any("Translation failed: OOM" in str(e.value) for e in at.error)
+    assert at.session_state["translate_output"] == ""
+    assert at.get("download_button")[0].disabled  # ty: ignore[unresolved-attribute]
+
+
+def test_failure_after_partial_output_keeps_the_partial() -> None:
+    def stream_then_die(*_args: object, **_kwargs: object):
+        yield _make_stream_chunk("Bonjour le ")
+        raise RuntimeError("OOM")
+
+    at = AppTest.from_file("streamlit_app.py")
+    with patch("mlx_lm.load", return_value=(MagicMock(), MagicMock())):
+        at.run(timeout=60)
+    _translate_with(at, "hello world", side_effect=stream_then_die)
+
+    assert any("after partial output" in str(e.value) for e in at.error)
+    assert at.session_state["translate_output"] == "Bonjour le"
+    assert not at.get("download_button")[0].disabled  # ty: ignore[unresolved-attribute]
+    assert at.session_state["download_name"] == "translation-French.txt"
+
+
+def test_first_failure_keeps_the_empty_state_panel() -> None:
+    # An earlier fix painted a blank st.code here, leaving a featureless grey
+    # rectangle where the "Translation appears here" panel had been.
+    at = AppTest.from_file("streamlit_app.py")
+    with patch("mlx_lm.load", return_value=(MagicMock(), MagicMock())):
+        at.run(timeout=60)
+    _translate_with(at, "hello", side_effect=RuntimeError("OOM"))
+
+    assert not at.get("code")
+    assert len(at.text_area) == 3
+
+
+def test_text_translation_does_not_reset_the_document_languages() -> None:
+    # The Text tab's rerun is deferred to the bottom of the script. Taken in
+    # place it aborted before `with doc_tab:` registered its widgets, and
+    # Streamlit's stale-widget purge then dropped them -- so the setdefault
+    # block silently re-seeded the Document pickers to English/French and the
+    # next document translation ran the wrong pair.
+    streams: list[dict[str, Any]] = [
+        {"return_value": iter([_make_stream_chunk("Bonjour")])},
+        {"return_value": iter([])},
+        {"side_effect": RuntimeError("OOM")},
+    ]
+    for stream in streams:
+        at = AppTest.from_file("streamlit_app.py")
+        with patch("mlx_lm.load", return_value=(MagicMock(), MagicMock())):
+            at.run(timeout=60)
+            at.selectbox[2].set_value("Japanese")
+            at.selectbox[3].set_value("German")
+            at.run(timeout=60)
+
+        _translate_with(at, "hello world", **stream)
+
+        assert at.selectbox[2].value == "Japanese", stream
+        assert at.selectbox[3].value == "German", stream

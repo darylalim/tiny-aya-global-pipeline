@@ -30,6 +30,10 @@ PANEL_HEIGHT: int = 450
 # Text-tab input cap. Reaches the browser as HTML maxlength, so it truncates
 # silently -- the placeholder names it because nothing else can.
 MAX_INPUT_CHARS: int = 30000
+# Download names before anything has been translated. Each reset path uses
+# these rather than its own literal, so the three of them cannot drift.
+DEFAULT_TEXT_DOWNLOAD: str = "translation.txt"
+DEFAULT_DOC_DOWNLOAD: str = "translation.md"
 SAME_LANGUAGE_WARNING: str = "Please pick two different languages."
 NO_OUTPUT_WARNING: str = (
     "The model returned an empty translation. Try again, or rephrase the input."
@@ -249,6 +253,19 @@ def stream_translate(
 # token-aware packer that splits a document into translatable pieces.
 
 _BLANK_LINE_RE = re.compile(r"\n\s*\n")
+# Every ASCII punctuation character -- exactly the set CommonMark permits to be
+# backslash-escaped, and deliberately wider than "the metacharacters one thinks
+# of". st.caption renders more than CommonMark: Streamlit also handles LaTeX
+# ($...$), emoji shortcodes (:tada:) and HTML entities (&amp;), so a filename
+# like `budget $100 vs $200.pdf` or `photo:sunglasses:.pdf` still renders as
+# markup under a CommonMark-only class. A backslash before ASCII punctuation is
+# never displayed, so over-escaping costs nothing.
+_MD_PUNCTUATION = r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""
+_MD_SPECIAL_RE = re.compile(f"([{re.escape(_MD_PUNCTUATION)}])")
+# Characters that would corrupt Streamlit's unquoted Content-Disposition
+# header, or escape the download directory: quotes, backslashes, forward
+# slashes and C0/DEL control characters.
+_UNSAFE_FILENAME_RE = re.compile(r'[\x00-\x1f\x7f"\\/]')
 # Sentence boundaries for Latin punctuation plus CJK full stops, since the app
 # translates across all 67 languages. The two need different whitespace rules:
 # Latin prose separates sentences with a space (and requiring one is what keeps
@@ -662,9 +679,45 @@ def translate_document(
         done.append(partial)
 
 
+def escape_markdown(text: str) -> str:
+    """Backslash-escape GFM metacharacters so ``text`` renders literally.
+
+    `st.caption` and `st.markdown` parse GitHub-flavored Markdown, so an
+    upload named ``*draft*.pdf`` renders as italic ``draft.pdf`` and
+    ``[report](https://example.com).pdf`` renders as a live link -- in the
+    caption whose entire job is to state the filename accurately. CommonMark
+    lets any ASCII punctuation be backslash-escaped, and the escape itself is
+    not shown.
+    """
+    return _MD_SPECIAL_RE.sub(r"\\\1", text)
+
+
+def safe_download_stem(file_name: str) -> str:
+    """Strip characters that would corrupt a Content-Disposition header.
+
+    Streamlit builds the header as ``f'filename="{filename}"'`` with no
+    quoting (``starlette_routes.py``), so an upload named ``re"port.pdf``
+    closes the quoted string early and the browser saves ``re``. Path
+    separators and control characters are replaced -- with ``_``, not removed,
+    which is why a non-empty stem can never sanitise away.
+
+    Non-ASCII is deliberately kept. Note the branch it actually takes:
+    Streamlit selects on ``filename.encode("latin1")``, **not** on ASCII, so
+    ``Bokmål`` goes down the *quoted* branch as a raw 0xE5 byte (RFC 6266 reads
+    an unencoded filename as ISO-8859-1) and only genuinely non-latin1 names
+    like 報告 reach the percent-encoded ``filename*=utf-8''`` branch. Both are
+    handled; neither needs stripping.
+    """
+    return _UNSAFE_FILENAME_RE.sub("_", file_name)
+
+
 def document_meta_line(file_name: str, source_lang: str, target_lang: str) -> str:
-    """One-line provenance for a settled document translation."""
-    return f"{file_name} · {source_lang} → {target_lang}"
+    """One-line provenance for a settled document translation.
+
+    The filename is escaped because the caption renders Markdown; the
+    language names are not, since all 67 are plain letters.
+    """
+    return f"{escape_markdown(file_name)} · {source_lang} → {target_lang}"
 
 
 def document_download_name(file_name: str, target_lang: str) -> str:
@@ -672,11 +725,13 @@ def document_download_name(file_name: str, target_lang: str) -> str:
 
     Every output was previously ``translation.md``, so translating several
     documents left ``translation.md``, ``translation (1).md`` ... with nothing
-    to tell them apart. All 67 language names are spaces- and separator-free,
-    and a dotless or dot-leading upload still yields a usable stem.
+    to tell them apart. All 67 language names are space- and separator-free,
+    and a dotless or dot-leading upload still yields a usable stem. The stem
+    comes from the *upload*, i.e. from the browser, so it is sanitised --
+    see ``safe_download_stem``.
     """
     stem = file_name.rsplit(".", 1)[0] if "." in file_name[1:] else file_name
-    return f"{stem or 'translation'}-{target_lang}.md"
+    return f"{safe_download_stem(stem) or 'translation'}-{target_lang}.md"
 
 
 import streamlit as st  # noqa: E402
@@ -806,7 +861,15 @@ st.session_state.setdefault("source_lang", "English")
 st.session_state.setdefault("target_lang", "French")
 st.session_state.setdefault("translate_input", "")
 st.session_state.setdefault("translate_output", "")
-st.session_state.setdefault("download_name", "translation.txt")
+st.session_state.setdefault("download_name", DEFAULT_TEXT_DOWNLOAD)
+# ("warning"|"error", text), or "" -- a message raised by the translate
+# block, which runs *below* the panels and then reruns. Without this the
+# rerun that repaints the output would also discard the explanation of it.
+st.session_state.setdefault("translate_notice", "")
+# Set by the Text translate block, actioned at the very bottom of the
+# script -- see the deferred-rerun block there for why it cannot rerun
+# in place.
+st.session_state.setdefault("_rerun_pending", False)
 st.session_state.setdefault("_do_translate", False)
 st.session_state.setdefault("doc_source_lang", "English")
 st.session_state.setdefault("doc_target_lang", "French")
@@ -816,7 +879,7 @@ st.session_state.setdefault("doc_output", "")
 # translation settles, so reading them later would describe the controls
 # instead of the text on screen.
 st.session_state.setdefault("doc_meta", "")
-st.session_state.setdefault("doc_download_name", "translation.md")
+st.session_state.setdefault("doc_download_name", DEFAULT_DOC_DOWNLOAD)
 
 
 def request_translate() -> None:
@@ -837,7 +900,7 @@ def clear_doc_output() -> None:
     """
     st.session_state.doc_output = ""
     st.session_state.doc_meta = ""
-    st.session_state.doc_download_name = "translation.md"
+    st.session_state.doc_download_name = DEFAULT_DOC_DOWNLOAD
 
 
 def clear_translate_output() -> None:
@@ -861,7 +924,7 @@ def clear_translate_output() -> None:
     programmatic session-state write.
     """
     st.session_state.translate_output = ""
-    st.session_state.download_name = "translation.txt"
+    st.session_state.download_name = DEFAULT_TEXT_DOWNLOAD
 
 
 def swap_languages() -> None:
@@ -871,8 +934,9 @@ def swap_languages() -> None:
         st.session_state.source_lang,
     )
     st.session_state.translate_input = st.session_state.translate_output
-    st.session_state.translate_output = ""
-    st.session_state.download_name = "translation.txt"
+    # Delegate rather than repeat: whatever "clear the settled translation"
+    # comes to mean must mean the same thing on both paths.
+    clear_translate_output()
 
 
 def swap_doc_languages() -> None:
@@ -942,6 +1006,15 @@ with text_tab:
     # -- Warning slot (above panels) ------------------------------------------
 
     warning_slot = st.container()
+    # Drain any notice left by the previous run's translate block. Read once
+    # and cleared, so it survives exactly the one rerun it was raised for.
+    if st.session_state.translate_notice:
+        _level, _text = st.session_state.translate_notice
+        st.session_state.translate_notice = ""
+        if _level == "error":
+            warning_slot.error(_text)
+        else:
+            warning_slot.warning(_text)
 
     # -- Side-by-side text panels ---------------------------------------------
 
@@ -949,7 +1022,16 @@ with text_tab:
     with col_input:
         # max_chars compiles to the HTML maxlength attribute, so an over-long
         # paste is clipped by the browser with no event the server can report
-        # on. Naming the cap in the placeholder is the only surface it has.
+        # on -- the placeholder is the only surface that cap has.
+        #
+        # Which limit binds depends on the script, and both are real. Measured
+        # with the model's own tokenizer: 30,000 characters of English prose is
+        # ~5,756 tokens, well inside MAX_INPUT_TOKENS, so for Latin scripts the
+        # character cap is what a user actually hits -- silently. The same
+        # 30,000 characters of Thai is ~24,897 tokens, so there the token gate
+        # fires first, and it says so explicitly with its own count. Naming the
+        # character cap here covers the failure that has no other surface; the
+        # token gate covers itself.
         st.text_area(
             "Input",
             height=PANEL_HEIGHT,
@@ -1065,32 +1147,16 @@ with text_tab:
                     # side-by-side row down for the duration and snap it back.
                     # A skeleton at PANEL_HEIGHT reflows nothing: it occupies
                     # the box render_output is about to. It also clears the
-                    # *previous* translation at click time -- that stale text
-                    # used to sit there looking current until the first new
-                    # token overwrote it.
+                    # *previous* translation, which used to sit there looking
+                    # current until the first new token overwrote it.
+                    #
+                    # No st.spinner alongside it: that would be a second
+                    # indicator for one operation, at the very cursor position
+                    # the paragraph above rules out.
                     output_placeholder.skeleton(height=PANEL_HEIGHT)
-                    try:
-                        with st.spinner("Translating..."):
-                            for partial in stream_translate(
-                                prompt_ids, model, tokenizer
-                            ):
-                                render_output(output_placeholder, partial)
-                    finally:
-                        # A stream that yields nothing, or raises before its
-                        # first token, never reaches render_output -- and the
-                        # skeleton would then animate forever beneath the
-                        # warning or the error. Restore through render_output,
-                        # not the empty-state text_area: re-emitting that
-                        # widget in the same script run would collide on its
-                        # auto-generated element id.
-                        if not partial:
-                            render_output(
-                                output_placeholder,
-                                st.session_state.translate_output,
-                            )
-                    if not partial.strip():
-                        warning_slot.warning(NO_OUTPUT_WARNING)
-                    else:
+                    for partial in stream_translate(prompt_ids, model, tokenizer):
+                        render_output(output_placeholder, partial)
+                    if partial.strip():
                         st.session_state.translate_output = partial
                         # Named here rather than at the button: target_lang
                         # keeps moving after a translation settles, so a name
@@ -1100,13 +1166,53 @@ with text_tab:
                         st.session_state.download_name = (
                             f"translation-{st.session_state.target_lang}.txt"
                         )
-                        # Rerun so the settled output and the download button
-                        # pick up the final value. RerunException extends
-                        # BaseException, so the `except Exception` below does
-                        # not swallow it.
-                        st.rerun()
+                    else:
+                        # State must agree with the message. Restoring the
+                        # previous translation here -- which an earlier version
+                        # did, to clear the skeleton -- put a downloadable
+                        # translation of *different* input directly under
+                        # "the model returned an empty translation".
+                        st.session_state.translate_output = ""
+                        st.session_state.download_name = DEFAULT_TEXT_DOWNLOAD
+                        st.session_state.translate_notice = (
+                            "warning",
+                            NO_OUTPUT_WARNING,
+                        )
+                    # Every exit path reruns, so the panel is always repainted
+                    # from translate_output rather than patched in place: that
+                    # is what lets the empty state come back as its text_area
+                    # (which cannot be re-emitted in this run -- the widget id
+                    # would collide) instead of a blank st.code. The notice
+                    # carries the message across, since this block will not run
+                    # again. Deferred, not immediate -- see the bottom of the
+                    # script.
+                    st.session_state._rerun_pending = True
             except Exception as e:
-                warning_slot.error(f"Translation failed: {e}")
+                # Keep whatever streamed before the failure, as the Document tab
+                # already does; `partial` is "" if it raised before the first
+                # token or before the stream even started.
+                if partial.strip():
+                    st.session_state.translate_output = partial
+                    st.session_state.download_name = (
+                        f"translation-{st.session_state.target_lang}.txt"
+                    )
+                    st.session_state.translate_notice = (
+                        "error",
+                        f"Translation failed after partial output: {e}",
+                    )
+                else:
+                    # No partial, so this run produced nothing -- and state
+                    # has to agree with the message here too. Leaving the
+                    # previous translation up put a downloadable translation of
+                    # *different* input under a failure notice, the same defect
+                    # the empty branch above was rewritten to remove.
+                    st.session_state.translate_output = ""
+                    st.session_state.download_name = DEFAULT_TEXT_DOWNLOAD
+                    st.session_state.translate_notice = (
+                        "error",
+                        f"Translation failed: {e}",
+                    )
+                st.session_state._rerun_pending = True
 
 with doc_tab:
     # -- Source: languages + upload -------------------------------------------
@@ -1153,8 +1259,13 @@ with doc_tab:
 
         # max_upload_size caps this widget alone; Streamlit's server default is
         # 200 MB, and an upload that size goes straight into in-process PDFium
-        # / Tesseract while the ~3.6 GB of weights are already resident. The
-        # browser rejects anything larger before a byte reaches the parser.
+        # / Tesseract while the ~3.6 GB of weights are already resident.
+        #
+        # It is a FRONTEND hint, not a server guarantee: the reject in
+        # starlette_routes.py still reads server.maxUploadSize, so a POST
+        # straight to /_stcore/upload_file is unaffected. That is acceptable
+        # here -- this app binds to localhost for one user -- but it is a
+        # browser-path mitigation, not a limit.
         uploaded = st.file_uploader(
             "Upload a document",
             type=DOCUMENT_TYPES,
@@ -1239,13 +1350,35 @@ with doc_tab:
             label_visibility="collapsed",
         )
 
+    def _restore_doc_meta() -> None:
+        """Put the provenance caption back when a run changed nothing.
+
+        The caption is cleared the moment Translate is committed, so every
+        path that leaves the *previous* output on screen has to restore the
+        line that describes it.
+        """
+        if st.session_state.doc_meta:
+            doc_meta_slot.caption(st.session_state.doc_meta)
+
     # -- Process document translation -----------------------------------------
 
     if translate_doc_clicked and uploaded is not None:
+        # Committed to a translation, so the caption above the panel stops
+        # describing the old one now rather than when the new one lands. The
+        # model load and parse can take minutes, and the caption exists to say
+        # which file and pair produced the text below it -- left up, it spent
+        # that whole window asserting a pair the controls no longer matched
+        # while new text streamed in underneath. Restored from state on the
+        # failure path below, where nothing actually changed.
+        doc_meta_slot.empty()
         if st.session_state.doc_source_lang == st.session_state.doc_target_lang:
             doc_warning_slot.warning(SAME_LANGUAGE_WARNING)
-        # A failed load has already reported itself into doc_warning_slot.
-        elif (loaded := ensure_model(doc_warning_slot)) is not None:
+            _restore_doc_meta()
+        # ensure_model's spinner is activity, so it goes to doc_status_slot --
+        # the same contract the "Reading document..." spinner below follows. It
+        # is the longest-lived indicator on the tab: minutes on a cold cache.
+        # A failed load has already reported itself into that slot.
+        elif (loaded := ensure_model(doc_status_slot)) is not None:
             model, tokenizer = loaded
             result = ""
             try:
@@ -1257,6 +1390,7 @@ with doc_tab:
                     doc_warning_slot.warning(
                         "No translatable text found in the document."
                     )
+                    _restore_doc_meta()
                 else:
                     last_rendered = -1
                     # A short PDF is one chunk, which is the common case, so
@@ -1316,6 +1450,7 @@ with doc_tab:
                         )
                     else:
                         doc_warning_slot.warning(NO_OUTPUT_WARNING)
+                        _restore_doc_meta()
             except Exception as e:
                 if result.strip():
                     st.session_state.doc_output = result
@@ -1332,6 +1467,13 @@ with doc_tab:
                     )
                 else:
                     doc_warning_slot.error(f"Translation failed: {e}")
+                    _restore_doc_meta()
+        else:
+            # ensure_model returned None and has already reported it. Nothing
+            # changed, so the caption cleared above the chain has to come back
+            # -- this was the one exit that fell through without restoring it,
+            # leaving the previous translation on screen unlabelled.
+            _restore_doc_meta()
 
     # -- Download -------------------------------------------------------------
 
@@ -1350,3 +1492,22 @@ with doc_tab:
         type="secondary",
         width="stretch",
     )
+
+
+# -- Deferred rerun ------------------------------------------------------------
+
+# The Text tab's translate block needs a rerun to repaint its panel and refresh
+# the download button, but it must not take it in place. `with doc_tab:` runs
+# after `with text_tab:`, so a rerun raised inside the Text tab aborts the
+# script before the Document tab registers any widget -- and Streamlit still
+# runs its stale-widget purge, because RerunException leaves premature_stop
+# False. The Document tab's keyed widgets are then dropped and the setdefault
+# block above silently re-seeds doc_source_lang / doc_target_lang to
+# English/French, so the next document translation runs the wrong pair with
+# nothing on screen to say so. A pending upload goes the same way.
+#
+# This is the risk CLAUDE.md already records against `st.tabs(on_change="rerun")`
+# -- it just also applied to the rerun that was already here.
+if st.session_state._rerun_pending:
+    st.session_state._rerun_pending = False
+    st.rerun()
