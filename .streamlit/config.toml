@@ -1,8 +1,13 @@
 # Streamlit's own theme for Tiny Aya Translate — dual light/dark mode.
 # These are Streamlit's stock default colors, stated explicitly rather than
-# inherited: defining both [theme.light] and [theme.dark] is what surfaces the
-# light/dark switch in Streamlit's settings menu, and a lone [theme] section
-# would lock the app to one mode. Typography, radii and link underlines are
+# inherited. Note what this file does NOT earn: a repo with no config at all
+# still gets the full System/Light/Dark switch, so defining both sections is
+# not what surfaces it. What is true is narrower -- once a *custom* theme
+# exists at all, both [theme.light] and [theme.dark] must carry values or
+# Streamlit collapses the settings menu to a single locked "Custom Theme"
+# entry. Keeping the file is a choice to state the palette explicitly and give
+# the theme tests something to read; deleting it would look identical.
+# Typography, radii and link underlines are
 # deliberately absent so they fall back to Streamlit's defaults (Source Sans,
 # 16px base, underlined links).
 #
@@ -12,14 +17,19 @@
 #   blue90 #0054a3 · blue60 #3d9df3
 # linkColor is Streamlit's resolved blueTextColor for each mode.
 #
-# codeBackgroundColor is the ONE deliberate departure from stock. The Text tab
-# streams into st.code and then swaps in a settled, disabled text_area; st.code
-# is painted with codeBackgroundColor, the text_area with secondaryBackgroundColor.
-# Left unset, codeBackgroundColor falls back to Streamlit's bgMix -- a 50/50 blend
-# of the two backgrounds (#1a1c24 dark, #f8f8fa light) -- so the output panel
-# visibly changed shade the instant a translation finished. Pinning it to
-# secondaryBackgroundColor makes that handoff seamless, which is what the
-# previous Nord theme did and why the seam never showed before.
+# codeBackgroundColor is the ONE deliberate departure from stock, and the reason
+# is now SPATIAL, not temporal. It used to be temporal: the Text tab streamed
+# into st.code and then swapped in a settled, disabled text_area, so the panel
+# changed shade the instant a translation finished. That swap is gone -- settled
+# output renders through st.code too -- so do not go looking for it.
+#
+# What survives is stronger. The Text tab's input text_area (painted with
+# secondaryBackgroundColor) and its output st.code (painted with
+# codeBackgroundColor) sit side by side in one row. Left unset,
+# codeBackgroundColor falls back to Streamlit's bgMix -- a 50/50 blend of the
+# two backgrounds (#1a1c24 dark, #f8f9fb light) -- which would make two adjacent
+# panels of a single workspace two different shades, permanently and across a
+# 16px gutter. Pinning them together is what makes the pair read as one surface.
 
 [theme.light]
 primaryColor = "#ff4b4b"

@@ -20,11 +20,20 @@ MAX_CHUNK_TOKENS: int = 7000
 # LiteParse handles PDFs and images natively. Office formats additionally need
 # LibreOffice on PATH, so they are left out rather than failing at parse time.
 DOCUMENT_TYPES: list[str] = ["pdf", "png", "jpg", "jpeg", "tiff", "webp"]
+# Per-upload size cap, well under Streamlit's 200 MB server default. Sized to
+# accept real documents and high-resolution scans while keeping a stray
+# drag-and-drop from handing hundreds of megabytes to an in-process parser.
+MAX_UPLOAD_MB: int = 50
 
 # Shared UI constants reused across the Text and Document tabs.
 PANEL_HEIGHT: int = 450
+# Text-tab input cap. Reaches the browser as HTML maxlength, so it truncates
+# silently -- the placeholder names it because nothing else can.
+MAX_INPUT_CHARS: int = 30000
 SAME_LANGUAGE_WARNING: str = "Please pick two different languages."
-NO_OUTPUT_WARNING: str = "Model produced no output."
+NO_OUTPUT_WARNING: str = (
+    "The model returned an empty translation. Try again, or rephrase the input."
+)
 
 # -- Languages ---------------------------------------------------------------
 # 67 languages across Europe, West Asia, South Asia, Asia Pacific, and Africa.
@@ -653,6 +662,23 @@ def translate_document(
         done.append(partial)
 
 
+def document_meta_line(file_name: str, source_lang: str, target_lang: str) -> str:
+    """One-line provenance for a settled document translation."""
+    return f"{file_name} · {source_lang} → {target_lang}"
+
+
+def document_download_name(file_name: str, target_lang: str) -> str:
+    """Name the download after the source file and the target language.
+
+    Every output was previously ``translation.md``, so translating several
+    documents left ``translation.md``, ``translation (1).md`` ... with nothing
+    to tell them apart. All 67 language names are spaces- and separator-free,
+    and a dotless or dot-leading upload still yields a usable stem.
+    """
+    stem = file_name.rsplit(".", 1)[0] if "." in file_name[1:] else file_name
+    return f"{stem or 'translation'}-{target_lang}.md"
+
+
 import streamlit as st  # noqa: E402
 
 st.set_page_config(
@@ -703,6 +729,26 @@ def render_output(placeholder: Any, text: str) -> None:
     placeholder.code(text, language=None, wrap_lines=True, height=PANEL_HEIGHT)
 
 
+def record_document_provenance(
+    slot: Any, file_name: str, source: str, target: str
+) -> None:
+    """Stamp the settled document output with what produced it.
+
+    Captured at translation time, not read from the widgets at render time:
+    the pickers keep moving after a translation settles, so a caption built
+    later would describe the controls rather than the text under it. Writes
+    the caption into ``slot`` as well as session state, because the Document
+    tab has no ``st.rerun()`` -- the slot above the output has already been
+    passed by the time a translation finishes.
+
+    All 67 language names are ASCII letters only (bar ``Bokmål``), with no
+    spaces or path separators, so the download stem needs no sanitising.
+    """
+    st.session_state.doc_meta = document_meta_line(file_name, source, target)
+    st.session_state.doc_download_name = document_download_name(file_name, target)
+    slot.caption(st.session_state.doc_meta)
+
+
 def ensure_model(warning_container: Any) -> tuple[Any, Any] | None:
     """Load the model on demand, reporting into ``warning_container``.
 
@@ -726,16 +772,33 @@ def ensure_model(warning_container: Any) -> tuple[Any, Any] | None:
     rather than being dead for the rest of the session.
     """
     try:
-        with warning_container.spinner("Loading model..."):
+        # The first load on a fresh machine pulls ~3.6 GB, which is minutes, not
+        # seconds; an unqualified "Loading model..." with no elapsed time is
+        # indistinguishable from a hang. show_time and the size both come from
+        # the README's own promise about that first click.
+        with warning_container.spinner(
+            "Loading model... the first run downloads ~3.6 GB from Hugging Face",
+            show_time=True,
+        ):
             return load_model()
     except Exception as e:
-        warning_container.error(f"Failed to load model: {e}")
+        # Keep the "Failed to load model: " prefix -- a UI test matches on it.
+        warning_container.error(
+            f"Failed to load model: {e}\n\nThe first run downloads ~3.6 GB from "
+            "Hugging Face. Check your connection and disk space, then click "
+            "Translate again."
+        )
         return None
 
 
 # -- Main page ----------------------------------------------------------------
 
 st.title("Tiny Aya Translate")
+# "sent to a server", not "sent anywhere": the model-load spinner and the
+# Document tab's OCR notice both announce downloads, so an absolute claim
+# would read as a contradiction two clicks later. Outbound is the property
+# a user is actually deciding about when they paste text in.
+st.caption("67 languages, translated on your Mac — nothing is sent to a server.")
 
 # -- Session state defaults ---------------------------------------------------
 
@@ -743,15 +806,62 @@ st.session_state.setdefault("source_lang", "English")
 st.session_state.setdefault("target_lang", "French")
 st.session_state.setdefault("translate_input", "")
 st.session_state.setdefault("translate_output", "")
+st.session_state.setdefault("download_name", "translation.txt")
 st.session_state.setdefault("_do_translate", False)
 st.session_state.setdefault("doc_source_lang", "English")
 st.session_state.setdefault("doc_target_lang", "French")
 st.session_state.setdefault("doc_output", "")
+# Provenance for the document output, captured at translation time rather than
+# read from the widgets at render time: the pickers keep moving after a
+# translation settles, so reading them later would describe the controls
+# instead of the text on screen.
+st.session_state.setdefault("doc_meta", "")
+st.session_state.setdefault("doc_download_name", "translation.md")
 
 
 def request_translate() -> None:
     """Flag that a translation was requested (processed after controls row)."""
     st.session_state._do_translate = True
+
+
+def clear_doc_output() -> None:
+    """Drop the previous file's translation when the upload changes.
+
+    ``st.session_state.doc_output`` outlives the upload it came from, so
+    without this a newly uploaded file renders -- and offers for download as
+    ``translation.md`` -- the *previous* file's translation, with nothing on
+    screen tying the output to the filename above it. It also defeated the
+    "No translatable text found" guard: a blank upload showed that warning
+    directly above the last document's intact output. Also fires when the
+    file is removed, which is the same invalidation.
+    """
+    st.session_state.doc_output = ""
+    st.session_state.doc_meta = ""
+    st.session_state.doc_download_name = "translation.md"
+
+
+def clear_translate_output() -> None:
+    """Drop a settled translation when either language picker moves.
+
+    The settled output is an unlabelled ``st.code`` block -- no label, no
+    caption, no placeholder -- so nothing on screen names the pair that
+    produced it. Change To from French to German and the card above asserts
+    English -> German while the panel below still holds French, with Download
+    still offering it.
+
+    The Document tab answers the same question the other way: it keeps a
+    settled output across a language change and discloses the real pair in
+    ``doc_meta``. That asymmetry is deliberate -- the Text tab has no
+    provenance surface to disclose into, and adding one would push the right
+    panel out of line with the left.
+
+    Only the output goes; ``translate_input`` is left alone so re-pressing
+    Translate is one click. ``swap_languages`` needs no hook of its own -- it
+    already clears the output, and Streamlit does not fire ``on_change`` for a
+    programmatic session-state write.
+    """
+    st.session_state.translate_output = ""
+    st.session_state.download_name = "translation.txt"
 
 
 def swap_languages() -> None:
@@ -762,6 +872,22 @@ def swap_languages() -> None:
     )
     st.session_state.translate_input = st.session_state.translate_output
     st.session_state.translate_output = ""
+    st.session_state.download_name = "translation.txt"
+
+
+def swap_doc_languages() -> None:
+    """Swap the Document tab's source and target languages.
+
+    Languages only, unlike ``swap_languages``: the Text tab's swap also moves
+    the output into the input, but a document's source is an uploaded file,
+    so there is nothing to move it into. ``doc_output`` is deliberately left
+    alone -- the upload has not changed, and ``clear_doc_output`` owns that
+    invalidation.
+    """
+    st.session_state.doc_source_lang, st.session_state.doc_target_lang = (
+        st.session_state.doc_target_lang,
+        st.session_state.doc_source_lang,
+    )
 
 
 text_tab, doc_tab = st.tabs(
@@ -780,23 +906,36 @@ with text_tab:
                 "From",
                 LANGUAGES,
                 key="source_lang",
+                on_change=clear_translate_output,
                 label_visibility="collapsed",
             )
-        with col_swap:
+        # Bounded and centred, not stretched. Every st.columns child picks up
+        # min-width: calc(100% - 1.5rem) under @media (max-width: 640px)
+        # regardless of its weight, so below that breakpoint this 1-unit column
+        # becomes a full row -- and a tertiary button paints no background or
+        # border, so a stretched one became an *invisible* full-row tap target
+        # between the two pickers: measured 425x40 at a 500px viewport,
+        # clickable edge to edge, one stray tap from moving the output into the
+        # input and clearing it. A fixed 40 clamps to the parent, so the
+        # desktop column still renders the same button and only the hit area
+        # changes. It does not rescue the 640-800px band, where the column
+        # shrinks toward the 16px icon and 40 clamps down with it.
+        with col_swap.container(horizontal=True, horizontal_alignment="center"):
             st.button(
                 "",
                 key="swap",
                 icon=":material/swap_horiz:",
                 on_click=swap_languages,
-                width="stretch",
+                width=40,
                 type="tertiary",
-                help="Swap languages",
+                help="Swap languages and move the translation into the input",
             )
         with col_to:
             st.selectbox(
                 "To",
                 LANGUAGES,
                 key="target_lang",
+                on_change=clear_translate_output,
                 label_visibility="collapsed",
             )
 
@@ -808,33 +947,54 @@ with text_tab:
 
     col_input, col_output = st.columns(2)
     with col_input:
+        # max_chars compiles to the HTML maxlength attribute, so an over-long
+        # paste is clipped by the browser with no event the server can report
+        # on. Naming the cap in the placeholder is the only surface it has.
         st.text_area(
             "Input",
             height=PANEL_HEIGHT,
-            max_chars=30000,
+            max_chars=MAX_INPUT_CHARS,
+            placeholder=(
+                f"Enter text to translate (up to {MAX_INPUT_CHARS:,} characters)"
+            ),
             key="translate_input",
             label_visibility="collapsed",
         )
     with col_output:
         output_placeholder = st.empty()
-        output_placeholder.text_area(
-            "Output",
-            height=PANEL_HEIGHT,
-            placeholder="Translation",
-            disabled=True,
-            value=st.session_state.translate_output,
-            label_visibility="collapsed",
-        )
+        # Settled output goes through render_output -- the same st.code sink the
+        # streaming path already uses, and the one the Document tab uses for
+        # both states. Previously the panel swapped to a disabled text_area the
+        # instant streaming ended, changing font, weight and colour in one
+        # frame: Streamlit paints disabled content at fadedText40, measured
+        # 2.17:1 light and 3.53:1 dark, so the finished translation was *less*
+        # legible than the placeholder that preceded it, and a disabled
+        # textarea is unselectable, so it could not even be copied.
+        # The text_area survives as the empty state only, where it supplies the
+        # placeholder and balances the input panel opposite it.
+        if st.session_state.translate_output:
+            render_output(output_placeholder, st.session_state.translate_output)
+        else:
+            output_placeholder.text_area(
+                "Output",
+                height=PANEL_HEIGHT,
+                placeholder="Translation appears here",
+                disabled=True,
+                value="",
+                label_visibility="collapsed",
+            )
 
     # -- Controls row ---------------------------------------------------------
 
     # st.columns, not st.container(horizontal=True): the horizontal container is
     # a flex row whose children are `flex: 1 1 fit-content`, so a stretched button
     # grows from its *intrinsic* width rather than splitting the row evenly.
-    # Measured in-browser, that put Translate at 460.6px against Download's
-    # 465.4px -- a seam 4px off the 461/461 panels directly above, and a 14px gap
-    # against the panels' 16px. Columns are a proportional grid, which is what
-    # mirroring the panels needs.
+    # Columns are a proportional grid, which is what mirroring the panels needs.
+    # The reasoning is structural and still holds; the numbers that once backed
+    # it do NOT. They were measured under the old theme's baseFontSize = 14
+    # (Translate 460.6px vs Download 465.4px against 461/461 panels, a 14px gap
+    # against the panels' 16px), and the theme now inherits Streamlit's 16px
+    # base, which moves every intrinsic width and gap. Remeasure before quoting.
     sub_translate, sub_download = st.columns(
         2, vertical_alignment="center", gap="small"
     )
@@ -842,6 +1002,7 @@ with text_tab:
         st.button(
             "Translate",
             key="translate",
+            icon=":material/translate:",
             on_click=request_translate,
             type="primary",
             width="stretch",
@@ -850,9 +1011,13 @@ with text_tab:
         st.download_button(
             "Download",
             key="download",
+            icon=":material/download:",
             data=st.session_state.translate_output,
-            file_name="translation.txt",
+            file_name=st.session_state.download_name,
             mime="text/plain",
+            # Downloading changes no server state, and on_click defaults to
+            # "rerun" -- which re-executes both tab bodies for nothing.
+            on_click="ignore",
             disabled=not st.session_state.translate_output.strip(),
             type="secondary",
             width="stretch",
@@ -891,31 +1056,92 @@ with text_tab:
                         f"please keep it under {MAX_INPUT_TOKENS}."
                     )
                 else:
-                    with st.spinner("Translating..."):
-                        for partial in stream_translate(prompt_ids, model, tokenizer):
-                            render_output(output_placeholder, partial)
+                    # The activity indicator belongs in the panel the result
+                    # lands in. The script cursor here is below the panels AND
+                    # the controls row, so a bare spinner spends the run off
+                    # the fold -- the trap ensure_model and doc_status_slot
+                    # already document. warning_slot is above the fold but
+                    # sits above the panels, so it would push the whole
+                    # side-by-side row down for the duration and snap it back.
+                    # A skeleton at PANEL_HEIGHT reflows nothing: it occupies
+                    # the box render_output is about to. It also clears the
+                    # *previous* translation at click time -- that stale text
+                    # used to sit there looking current until the first new
+                    # token overwrote it.
+                    output_placeholder.skeleton(height=PANEL_HEIGHT)
+                    try:
+                        with st.spinner("Translating..."):
+                            for partial in stream_translate(
+                                prompt_ids, model, tokenizer
+                            ):
+                                render_output(output_placeholder, partial)
+                    finally:
+                        # A stream that yields nothing, or raises before its
+                        # first token, never reaches render_output -- and the
+                        # skeleton would then animate forever beneath the
+                        # warning or the error. Restore through render_output,
+                        # not the empty-state text_area: re-emitting that
+                        # widget in the same script run would collide on its
+                        # auto-generated element id.
+                        if not partial:
+                            render_output(
+                                output_placeholder,
+                                st.session_state.translate_output,
+                            )
                     if not partial.strip():
                         warning_slot.warning(NO_OUTPUT_WARNING)
                     else:
                         st.session_state.translate_output = partial
-                        # Rerun so the disabled output picks up the final value.
-                        # RerunException extends BaseException, so the `except
-                        # Exception` below does not swallow it.
+                        # Named here rather than at the button: target_lang
+                        # keeps moving after a translation settles, so a name
+                        # built at render time would describe the dropdown
+                        # instead of the bytes. Same reasoning as
+                        # record_document_provenance.
+                        st.session_state.download_name = (
+                            f"translation-{st.session_state.target_lang}.txt"
+                        )
+                        # Rerun so the settled output and the download button
+                        # pick up the final value. RerunException extends
+                        # BaseException, so the `except Exception` below does
+                        # not swallow it.
                         st.rerun()
             except Exception as e:
                 warning_slot.error(f"Translation failed: {e}")
 
 with doc_tab:
-    # -- Language bar ---------------------------------------------------------
+    # -- Source: languages + upload -------------------------------------------
 
     with st.container(border=True):
-        doc_col_from, doc_col_to = st.columns(2)
+        # Same [10, 1, 10] language row as the Text tab -- that row is the
+        # shared component, not the whole card. This card carries a second row
+        # because a document's source is a file, not a panel: describing the
+        # source is one operation, so the pickers and the dropzone are grouped
+        # rather than left as separate full-width siblings. Reversing a pair
+        # here previously meant retyping both languages into 67-item
+        # dropdowns, while the identical operation one tab over was a click.
+        doc_col_from, doc_col_swap, doc_col_to = st.columns(
+            [10, 1, 10], vertical_alignment="center"
+        )
         with doc_col_from:
             st.selectbox(
                 "From",
                 LANGUAGES,
                 key="doc_source_lang",
                 label_visibility="collapsed",
+            )
+        # Bounded and centred for the reason spelled out at the Text tab's
+        # swap. Same treatment because the two rows are one component, though
+        # a stray tap is recoverable here -- swap_doc_languages only flips the
+        # pickers.
+        with doc_col_swap.container(horizontal=True, horizontal_alignment="center"):
+            st.button(
+                "",
+                key="swap_doc",
+                icon=":material/swap_horiz:",
+                on_click=swap_doc_languages,
+                width=40,
+                type="tertiary",
+                help="Swap languages",
             )
         with doc_col_to:
             st.selectbox(
@@ -925,27 +1151,93 @@ with doc_tab:
                 label_visibility="collapsed",
             )
 
-    # -- Upload + controls ----------------------------------------------------
+        # max_upload_size caps this widget alone; Streamlit's server default is
+        # 200 MB, and an upload that size goes straight into in-process PDFium
+        # / Tesseract while the ~3.6 GB of weights are already resident. The
+        # browser rejects anything larger before a byte reaches the parser.
+        uploaded = st.file_uploader(
+            "Upload a document",
+            type=DOCUMENT_TYPES,
+            key="doc_upload",
+            on_change=clear_doc_output,
+            max_upload_size=MAX_UPLOAD_MB,
+            label_visibility="collapsed",
+        )
+        # Scans have no text layer, so the From picker doubles as the OCR
+        # language (see OCR_LANGUAGES). Getting it wrong does not fail loudly
+        # -- Tesseract returns confident garbage that sails past the "no
+        # translatable text" guard -- so the coupling has to be stated.
+        #
+        # st.info, not st.caption, and the reason is contrast, not emphasis.
+        # st.caption renders as opacity 0.6 on inherited body text -- `color:
+        # inherit` plus `opacity`, never reading the grayTextColor key, which
+        # exists and holds the same value -- landing textColor #31333f on
+        # #ffffff at 3.69:1 in light, under AA's 4.5:1 for 14px. Nothing in
+        # config.toml reaches it: a markdown color directive is multiplied by
+        # the same opacity and comes out worse. st.info paints blueTextColor
+        # on blueBackgroundColor, 6.68:1 light and 4.90:1 dark, and design.md
+        # files instructions under info and metadata under caption. This is an
+        # instruction with a silent-failure mode and a network side effect.
+        st.info(
+            "Scans are read with OCR in the source language — the first scan "
+            "in a new language downloads ~15 MB of OCR data.",
+            icon=":material/language:",
+        )
 
-    uploaded = st.file_uploader(
-        "Upload a document",
-        type=DOCUMENT_TYPES,
-        label_visibility="collapsed",
+    # -- Controls -------------------------------------------------------------
+
+    # Same 50/50 grid as the Text tab's controls row. The download used to sit
+    # alone below the output panel purely because the script cursor was there
+    # when its value became known; a reserved container decouples the two, so
+    # the produce and save actions read as one pair.
+    doc_translate_col, doc_download_col = st.columns(
+        2, vertical_alignment="center", gap="small"
     )
-    translate_doc_clicked = st.button(
-        "Translate document",
-        key="translate_doc",
-        disabled=uploaded is None,
-        type="primary",
-        width="stretch",
-    )
+    with doc_translate_col:
+        translate_doc_clicked = st.button(
+            "Translate document",
+            key="translate_doc",
+            icon=":material/translate:",
+            disabled=uploaded is None,
+            type="primary",
+            width="stretch",
+        )
+    doc_download_slot = doc_download_col.container()
 
     # -- Warning slot + streamed output ---------------------------------------
 
     doc_warning_slot = st.container()
+    # Activity slot, separate from the warning slot and declared above the
+    # output for the same reason ensure_model's spinner is: once the first
+    # chunk lands, the output panel is PANEL_HEIGHT tall, so anything created
+    # at the script cursor below it spends the whole run off the fold.
+    doc_status_slot = st.container()
+    doc_meta_slot = st.empty()
     doc_output_placeholder = st.empty()
     if st.session_state.doc_output:
+        # Which file, and which direction. The source is an off-screen filename
+        # chip, so unlike the Text tab's side-by-side panels there is nothing
+        # on screen that would make a stale output obvious.
+        if st.session_state.doc_meta:
+            doc_meta_slot.caption(st.session_state.doc_meta)
         render_output(doc_output_placeholder, st.session_state.doc_output)
+    else:
+        # Empty state, not dead space. Now that Download sits beside Translate
+        # rather than below the output, at rest the tab ended in two disabled
+        # buttons with nothing after them -- readable as a converter that only
+        # ever hands back a file. This panel says the translation appears here
+        # too, and reserves the exact footprint render_output will fill, so the
+        # first chunk lands in place instead of shoving PANEL_HEIGHT of page
+        # into existence. Mirrors the Text tab's empty state; the distinct
+        # label keeps the two auto-generated element ids apart.
+        doc_output_placeholder.text_area(
+            "Translated document",
+            height=PANEL_HEIGHT,
+            placeholder="Translated document appears here",
+            disabled=True,
+            value="",
+            label_visibility="collapsed",
+        )
 
     # -- Process document translation -----------------------------------------
 
@@ -957,7 +1249,7 @@ with doc_tab:
             model, tokenizer = loaded
             result = ""
             try:
-                with st.spinner("Reading document..."):
+                with doc_status_slot.spinner("Reading document..."):
                     chunks = cached_document_chunks(
                         uploaded.getvalue(), st.session_state.doc_source_lang
                     )
@@ -966,34 +1258,75 @@ with doc_tab:
                         "No translatable text found in the document."
                     )
                 else:
-                    progress = st.progress(0.0)
-                    status = st.empty()
                     last_rendered = -1
-                    for idx, cumulative in translate_document(
-                        chunks,
-                        st.session_state.doc_source_lang,
-                        st.session_state.doc_target_lang,
-                        model,
-                        tokenizer,
-                    ):
-                        result = cumulative
-                        progress.progress(idx / len(chunks))
-                        status.write(f"Translating section {idx + 1} of {len(chunks)}")
-                        # Re-render only on chunk boundaries; re-sending the
-                        # whole growing document every token is O(n²).
-                        if idx != last_rendered:
-                            render_output(doc_output_placeholder, result)
-                            last_rendered = idx
-                    progress.progress(1.0)
-                    status.empty()
-                    render_output(doc_output_placeholder, result)
+                    # A short PDF is one chunk, which is the common case, so
+                    # the plural cannot be hardcoded into the status label.
+                    n_sections = len(chunks)
+                    sections = "section" if n_sections == 1 else "sections"
+                    # st.status rather than a progress bar plus a caption: it
+                    # reports "running" with a spinner instead of a fraction,
+                    # and the fraction was the wrong shape here. Chunks
+                    # complete, so the only honest value is idx/len(chunks) --
+                    # which sits at 0% for the whole of the first chunk, and
+                    # therefore for the entire run of a single-chunk document.
+                    # Its context manager also settles the state itself:
+                    # "complete" on a clean exit, "error" when an exception
+                    # propagates. The pair it replaces did neither on the
+                    # failure path, stranding a half-filled bar and a
+                    # "Translating section k of n" caption under the error.
+                    # type="compact" because the body is empty: render_output
+                    # writes into doc_output_placeholder, an st.empty() created
+                    # above this block, so nothing nests inside the status. The
+                    # default type would be a bordered expander over nothing.
+                    with doc_status_slot.status(
+                        f"Translating {n_sections} {sections}", type="compact"
+                    ) as doc_status:
+                        for idx, cumulative in translate_document(
+                            chunks,
+                            st.session_state.doc_source_lang,
+                            st.session_state.doc_target_lang,
+                            model,
+                            tokenizer,
+                        ):
+                            result = cumulative
+                            # Everything in here is chunk-scoped, but
+                            # translate_document yields once per *token*. Both
+                            # the label and the rendered output change only
+                            # when idx does, so re-emitting them per token
+                            # bought two identical deltas a token: measured at
+                            # 1.15 s of server work per 15k tokens against
+                            # 1.5 ms guarded. Re-sending the whole growing
+                            # document every token is O(n²) besides.
+                            if idx != last_rendered:
+                                doc_status.update(
+                                    label=f"Translating section {idx + 1} "
+                                    f"of {n_sections}"
+                                )
+                                render_output(doc_output_placeholder, result)
+                                last_rendered = idx
+                        render_output(doc_output_placeholder, result)
+                        doc_status.update(label=f"Translated {n_sections} {sections}")
                     if result.strip():
                         st.session_state.doc_output = result
+                        record_document_provenance(
+                            doc_meta_slot,
+                            uploaded.name,
+                            st.session_state.doc_source_lang,
+                            st.session_state.doc_target_lang,
+                        )
                     else:
                         doc_warning_slot.warning(NO_OUTPUT_WARNING)
             except Exception as e:
                 if result.strip():
                     st.session_state.doc_output = result
+                    # A partial result is still downloadable, so it still needs
+                    # to say which file and pair it came from.
+                    record_document_provenance(
+                        doc_meta_slot,
+                        uploaded.name,
+                        st.session_state.doc_source_lang,
+                        st.session_state.doc_target_lang,
+                    )
                     doc_warning_slot.error(
                         f"Translation failed after partial output: {e}"
                     )
@@ -1002,12 +1335,17 @@ with doc_tab:
 
     # -- Download -------------------------------------------------------------
 
-    st.download_button(
+    # Emitted last, as before, so it picks up a doc_output set by the translate
+    # block above -- but into the slot reserved beside Translate, so it renders
+    # up in the controls row rather than below the output panel.
+    doc_download_slot.download_button(
         "Download",
         key="download_doc",
+        icon=":material/download:",
         data=st.session_state.doc_output,
-        file_name="translation.md",
+        file_name=st.session_state.doc_download_name,
         mime="text/markdown",
+        on_click="ignore",
         disabled=not st.session_state.doc_output.strip(),
         type="secondary",
         width="stretch",

@@ -135,16 +135,25 @@ def test_swap_moves_output_to_input() -> None:
 # -- Text panels ---------------------------------------------------------------
 
 
-def test_input_text_area_has_no_placeholder(app: AppTest) -> None:
-    assert app.text_area[0].placeholder == ""
+def test_input_placeholder_names_the_character_cap(app: AppTest) -> None:
+    # max_chars reaches the browser as HTML maxlength and truncates silently,
+    # so the placeholder is the only place the cap can announce itself.
+    assert "30,000" in app.text_area[0].placeholder
 
 
-def test_output_uses_text_area(app: AppTest) -> None:
-    assert len(app.text_area) == 2
+def test_empty_output_panel_uses_a_text_area(app: AppTest) -> None:
+    # Only the EMPTY state is a text_area; a settled translation renders
+    # through render_output/st.code (see test_translate_success_shows_result).
+    # Three at rest: the Text tab's input and empty output, plus the
+    # Document tab's empty output panel.
+    assert len(app.text_area) == 3
 
 
 def test_output_text_area_placeholder(app: AppTest) -> None:
-    assert app.text_area[1].placeholder == "Translation"
+    # An instructional phrase, not a bare noun: the settled output is painted
+    # in the same muted grey, so a one-word translation and a one-word
+    # placeholder would be indistinguishable.
+    assert app.text_area[1].placeholder == "Translation appears here"
 
 
 # -- Translate flow ------------------------------------------------------------
@@ -159,8 +168,13 @@ def test_translate_button_enabled_when_model_loaded(app: AppTest) -> None:
 
 
 def test_translate_success_shows_result() -> None:
+    # Settled output renders through render_output/st.code, not the disabled
+    # text_area -- which survives only as the empty state.
     at = _run_inference_test(input_text="Hello", chunk_text="Bonjour")
-    assert at.text_area[1].value == "Bonjour"
+    assert at.get("code")[0].value == "Bonjour"  # ty: ignore[unresolved-attribute]
+    # The Text tab's output panel is no longer a text_area; its input and
+    # the Document tab's empty output panel remain.
+    assert len(at.text_area) == 2
 
 
 def test_translate_empty_text_shows_warning(app: AppTest) -> None:
@@ -247,7 +261,7 @@ def test_translate_at_input_token_limit_succeeds() -> None:
         at.button("translate").click()
         at.run(timeout=60)
 
-    assert at.text_area[1].value == "OK"
+    assert at.get("code")[0].value == "OK"  # ty: ignore[unresolved-attribute]
     assert not at.warning
 
 
@@ -300,7 +314,7 @@ def test_empty_stream_shows_warning() -> None:
         at.run(timeout=60)
 
     warning_values = [str(w.value) for w in at.warning]
-    assert any("no output" in v for v in warning_values)
+    assert any("empty translation" in v for v in warning_values)
 
 
 def test_end_response_only_stream_shows_warning() -> None:
@@ -318,7 +332,7 @@ def test_end_response_only_stream_shows_warning() -> None:
         at.run(timeout=60)
 
     warning_values = [str(w.value) for w in at.warning]
-    assert any("no output" in v for v in warning_values)
+    assert any("empty translation" in v for v in warning_values)
 
 
 # -- Download button -----------------------------------------------------------
@@ -345,7 +359,7 @@ def test_download_button_enabled_when_output_present() -> None:
 # -- Output text area ----------------------------------------------------------
 
 
-def test_output_text_area_disabled(app: AppTest) -> None:
+def test_empty_output_panel_is_disabled(app: AppTest) -> None:
     assert app.text_area[1].disabled
 
 
@@ -365,7 +379,7 @@ def test_page_renders_without_loading_the_model() -> None:
 
     load.assert_not_called()
     assert len(at.tabs) == 2
-    assert len(at.text_area) == 2
+    assert len(at.text_area) == 3
     assert not at.error
 
 
@@ -423,3 +437,126 @@ def test_document_uploader_offers_no_parser_choice(app: AppTest) -> None:
     # One parser, so no backend radio -- the Text tab's swap button and the two
     # language selectboxes per tab are the only widgets of their kind.
     assert not [r for r in app.radio]
+
+
+def test_document_uploader_caps_upload_size(app: AppTest) -> None:
+    # Streamlit's server default is 200 MB, and a file that size reaches an
+    # in-process parser with the weights already resident. The cap is a widget
+    # parameter, so it shows up on the uploader's own proto.
+    size = app.get("file_uploader")[0].max_upload_size_mb  # ty: ignore[unresolved-attribute]
+    assert 0 < size < 200
+
+
+def test_new_upload_clears_the_previous_translation(app: AppTest) -> None:
+    # doc_output outlives the upload it came from. Without the on_change hook a
+    # new file rendered the *previous* file's translation, and offered it for
+    # download under the new filename.
+    app.session_state["doc_output"] = "PREVIOUS FILE TRANSLATION"
+    _rerun_with_mocks(app)
+    assert len(app.get("code")) == 1
+    assert not app.get("download_button")[1].disabled  # ty: ignore[unresolved-attribute]
+
+    app.get("file_uploader")[0].upload("second.pdf", b"%PDF-1.4 fake")  # ty: ignore[unresolved-attribute]
+    _rerun_with_mocks(app)
+
+    assert app.session_state["doc_output"] == ""
+    assert not app.get("code")
+    assert app.get("download_button")[1].disabled  # ty: ignore[unresolved-attribute]
+
+
+def test_removing_the_upload_also_clears_the_translation(app: AppTest) -> None:
+    # Removing the file is the same invalidation as replacing it: the output
+    # panel must not keep serving a translation of a document that is no longer
+    # loaded. Upload first -- clearing a never-populated uploader is a no-op and
+    # fires no change event.
+    app.get("file_uploader")[0].upload("first.pdf", b"%PDF-1.4 fake")  # ty: ignore[unresolved-attribute]
+    _rerun_with_mocks(app)
+    app.session_state["doc_output"] = "FIRST FILE TRANSLATION"
+    _rerun_with_mocks(app)
+    assert len(app.get("code")) == 1
+
+    app.get("file_uploader")[0].clear()  # ty: ignore[unresolved-attribute]
+    _rerun_with_mocks(app)
+
+    assert app.session_state["doc_output"] == ""
+    assert not app.get("code")
+
+
+# -- Download buttons ----------------------------------------------------------
+
+
+def test_changing_a_language_clears_the_settled_translation(app: AppTest) -> None:
+    # The settled output is an unlabelled st.code block, so nothing on screen
+    # names the pair that produced it -- a stale panel would silently
+    # contradict the card above it.
+    app.session_state["translate_output"] = "Bonjour"
+    app.session_state["download_name"] = "translation-French.txt"
+    _rerun_with_mocks(app)
+    assert len(app.get("code")) == 1
+
+    app.selectbox[1].set_value("German")
+    _rerun_with_mocks(app)
+
+    assert app.session_state["translate_output"] == ""
+    assert app.session_state["download_name"] == "translation.txt"
+    assert not app.get("code")
+
+
+def test_unrelated_reruns_keep_the_settled_translation(app: AppTest) -> None:
+    # Guard against an over-eager rewrite that clears on every rerun.
+    app.session_state["translate_output"] = "Bonjour"
+    _rerun_with_mocks(app)
+    _rerun_with_mocks(app)
+
+    assert app.session_state["translate_output"] == "Bonjour"
+
+
+def test_text_download_name_records_the_target_language() -> None:
+    # Captured when the output settles, not read from the picker at render
+    # time -- target_lang keeps moving after a translation is done. The
+    # rendered file_name is not assertable here: DownloadButton's proto has no
+    # file_name field (the bytes go to the media manager and the proto carries
+    # only a url), so the wiring is guarded at source level instead by
+    # test_text_download_button_uses_the_recorded_name.
+    at = _run_inference_test(input_text="Hello", chunk_text="Bonjour")
+    assert at.session_state["download_name"] == "translation-French.txt"
+
+
+def test_document_swap_button_exists(app: AppTest) -> None:
+    assert app.button("swap_doc") is not None
+
+
+def test_document_swap_flips_languages(app: AppTest) -> None:
+    # The Document selectboxes follow the Text tab's two.
+    app.button("swap_doc").click()
+    _rerun_with_mocks(app)
+
+    assert app.selectbox[2].value == "French"
+    assert app.selectbox[3].value == "English"
+
+
+def test_document_swap_leaves_the_output_alone(app: AppTest) -> None:
+    # Unlike the Text tab's swap there is no input to move the output into, and
+    # the upload has not changed -- clear_doc_output owns that invalidation.
+    app.session_state["doc_output"] = "TRANSLATED"
+    app.button("swap_doc").click()
+    _rerun_with_mocks(app)
+
+    assert app.session_state["doc_output"] == "TRANSLATED"
+
+
+def test_new_upload_resets_the_download_filename(app: AppTest) -> None:
+    app.session_state["doc_download_name"] = "report-French.md"
+    app.session_state["doc_meta"] = "report.pdf · English → French"
+    app.get("file_uploader")[0].upload("second.pdf", b"%PDF-1.4 fake")  # ty: ignore[unresolved-attribute]
+    _rerun_with_mocks(app)
+
+    assert app.session_state["doc_download_name"] == "translation.md"
+    assert app.session_state["doc_meta"] == ""
+
+
+def test_download_buttons_do_not_trigger_a_rerun(app: AppTest) -> None:
+    # on_click defaults to "rerun", but a download changes no server state --
+    # so every click re-executed both tab bodies to rebuild an identical page.
+    for button in app.get("download_button"):
+        assert button.ignore_rerun  # ty: ignore[unresolved-attribute]

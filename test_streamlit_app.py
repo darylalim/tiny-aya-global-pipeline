@@ -13,6 +13,8 @@ from streamlit_app import (
     chunk_text,
     clean_model_output,
     count_tokens,
+    document_download_name,
+    document_meta_line,
     hard_windows,
     heading_level,
     heading_line,
@@ -49,9 +51,13 @@ def test_no_deprecated_use_container_width() -> None:
 
 
 def test_buttons_use_width_stretch() -> None:
-    # The five full-width controls (swap, translate, download, translate_doc,
-    # download_doc) set width="stretch".
-    assert _APP_SOURCE.count('width="stretch"') == 5
+    # The four full-width controls (translate, download, translate_doc,
+    # download_doc) set width="stretch". The two swap buttons are deliberately
+    # NOT among them: stretched inside a 1-unit column they became invisible
+    # full-row tap targets below the 640px breakpoint, so both are pinned to a
+    # fixed width and centred instead.
+    assert _APP_SOURCE.count('width="stretch"') == 4
+    assert _APP_SOURCE.count("width=40,") == 2
 
 
 # -- streamlit_app.py shared UI constants --------------------------------------
@@ -68,7 +74,7 @@ def test_warning_strings_defined_once() -> None:
     # The Text- and Document-tab call sites reference SAME_LANGUAGE_WARNING /
     # NO_OUTPUT_WARNING, so neither raw literal should be duplicated.
     assert _APP_SOURCE.count('"Please pick two different languages."') == 1
-    assert _APP_SOURCE.count('"Model produced no output."') == 1
+    assert _APP_SOURCE.count("empty translation. Try again") == 1
 
 
 # -- streamlit_app.py page config ----------------------------------------------
@@ -1193,3 +1199,40 @@ def test_render_output_is_single_code_sink() -> None:
     # `.code(...)` at a call site, which passes the helper unit test and the
     # height-literal guard yet defeats the dedup the refactor exists for.
     assert _APP_SOURCE.count(".code(") == 1
+
+
+# -- document provenance -------------------------------------------------------
+
+
+def test_document_meta_line_names_file_and_direction() -> None:
+    assert (
+        document_meta_line("report.pdf", "English", "French")
+        == "report.pdf \u00b7 English \u2192 French"
+    )
+
+
+def test_document_download_name_uses_stem_and_target() -> None:
+    # Every output used to be translation.md, so a run of documents produced
+    # translation.md, translation (1).md ... with nothing to tell them apart.
+    assert document_download_name("report.pdf", "French") == "report-French.md"
+
+
+def test_document_download_name_splits_on_the_last_dot() -> None:
+    assert document_download_name("scan.tar.gz", "German") == "scan.tar-German.md"
+
+
+def test_document_download_name_handles_names_without_a_usable_stem() -> None:
+    # A dotless upload keeps its whole name; a dot-leading one is not treated
+    # as all-extension; an empty name still yields a valid download.
+    assert document_download_name("noext", "Spanish") == "noext-Spanish.md"
+    assert document_download_name(".hidden", "Spanish") == ".hidden-Spanish.md"
+    assert document_download_name("", "French") == "translation-French.md"
+
+
+def test_text_download_button_uses_the_recorded_name() -> None:
+    # AppTest cannot see a download button's file_name (the proto carries only
+    # a media-manager url), so guard the wiring here: the Text tab must read
+    # the captured name, never re-inline the old constant.
+    assert "file_name=st.session_state.download_name," in _APP_SOURCE
+    assert '"translation.txt"' in _APP_SOURCE  # the reset default only
+    assert _APP_SOURCE.count('file_name="translation.txt"') == 0
