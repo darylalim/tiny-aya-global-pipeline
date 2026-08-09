@@ -406,11 +406,17 @@ def test_stream_translate_uses_default_params(
 
 def test_document_types_are_liteparse_native() -> None:
     # PDFs and images parse with no external binary. Office formats would need
-    # LibreOffice on PATH and HTML is unsupported, so neither is offered rather
-    # than accepting an upload that fails at parse time.
+    # LibreOffice on PATH, and HTML and HEIC are rejected by the parser outright
+    # ("unsupported file format"), so none are offered rather than accepting an
+    # upload that fails at parse time. HEIC is the tempting one -- it is the
+    # iPhone camera default, but listing it would only move the failure later.
     assert "pdf" in streamlit_app.DOCUMENT_TYPES
     assert "png" in streamlit_app.DOCUMENT_TYPES
-    assert not {"docx", "pptx", "xlsx", "html"} & set(streamlit_app.DOCUMENT_TYPES)
+    # Both TIFF spellings, or a .tif scan is unselectable in the file picker.
+    assert {"tiff", "tif"} <= set(streamlit_app.DOCUMENT_TYPES)
+    assert not {"docx", "pptx", "xlsx", "html", "heic"} & set(
+        streamlit_app.DOCUMENT_TYPES
+    )
 
 
 # -- load_document_markdown ----------------------------------------------------

@@ -19,7 +19,10 @@ MAX_INPUT_TOKENS: int = 8192
 MAX_CHUNK_TOKENS: int = 7000
 # LiteParse handles PDFs and images natively. Office formats additionally need
 # LibreOffice on PATH, so they are left out rather than failing at parse time.
-DOCUMENT_TYPES: list[str] = ["pdf", "png", "jpg", "jpeg", "tiff", "webp"]
+# Both TIFF spellings are listed: this list reaches the browser as a file-type
+# filter, scanners emit .tif as often as .tiff, and the parser reads either --
+# omitting one greyed the file out in the picker with nothing to explain it.
+DOCUMENT_TYPES: list[str] = ["pdf", "png", "jpg", "jpeg", "tiff", "tif", "webp"]
 # Per-upload size cap, well under Streamlit's 200 MB server default. Sized to
 # accept real documents and high-resolution scans while keeping a stray
 # drag-and-drop from handing hundreds of megabytes to an in-process parser.
