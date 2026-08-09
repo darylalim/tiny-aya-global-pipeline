@@ -3,6 +3,14 @@ name: Release
 # Dispatch-triggered rather than tag-triggered: this workflow *creates* the tag.
 # A tag pushed with GITHUB_TOKEN does not trigger other workflows, so an
 # `on: push: tags:` release job would silently never fire.
+#
+# ci.yml drafts a release for any version bump that lands on main, which makes
+# this the second of two release paths. They do not collide, for the same reason
+# stated above: the bump commit below is pushed with GITHUB_TOKEN, so it does not
+# start a CI run at all -- and even if it did, ci.yml skips any version that is
+# already tagged, which this workflow has done by then. What this path adds is
+# performing the bump itself, which `uv version --bump` gets right across both
+# pyproject.toml and uv.lock.
 on:
   workflow_dispatch:
     inputs:
@@ -34,8 +42,10 @@ jobs:
         with:
           enable-cache: true
 
+      # `--locked`, matching ci.yml: uv.lock records the project's own version,
+      # so a bare sync would paper over a stale lock right before bumping it.
       - name: Install dependencies (core + dev tools)
-        run: uv sync
+        run: uv sync --locked
 
       # Never cut a release from a red tree — same gate as ci.yml.
       - name: Ruff format check
@@ -66,40 +76,13 @@ jobs:
       # Commits land directly on main, so there are no merged PRs for GitHub's
       # own --generate-notes to aggregate. Parse the conventional-commit log
       # instead. Must run before the new tag exists, or the range collapses.
+      # The script is shared with ci.yml's release job so the two paths cannot
+      # drift into describing the same commits differently.
       - name: Build changelog from conventional commits
-        id: notes
         env:
           VERSION: ${{ steps.bump.outputs.version }}
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}
-        run: |
-          prev="$(git describe --tags --abbrev=0 || true)"
-          range=""
-          [ -n "$prev" ] && range="$prev..HEAD"
-          notes="$RUNNER_TEMP/notes.md"
-          : > "$notes"
-
-          section() {
-            body="$(git log --no-merges --format='%s' $range \
-                    | grep -E "^$1(\(.+\))?: " \
-                    | sed -E "s/^$1(\(.+\))?: /- /" || true)"
-            if [ -n "$body" ]; then
-              printf '### %s\n\n%s\n\n' "$2" "$body" >> "$notes"
-            fi
-          }
-
-          # chore/test/ci/build are deliberately omitted — the compare link
-          # below covers them, and they are noise in user-facing notes.
-          section feat     "Features"
-          section fix      "Fixes"
-          section perf     "Performance"
-          section refactor "Refactoring"
-          section docs     "Documentation"
-
-          if [ -n "$prev" ]; then
-            printf '**Full changelog:** %s/compare/%s...v%s\n' \
-              "$REPO_URL" "$prev" "$VERSION" >> "$notes"
-          fi
-          echo "path=$notes" >> "$GITHUB_OUTPUT"
+        run: .github/scripts/release-notes.sh "$RUNNER_TEMP/notes.md"
 
       - name: Commit, tag, push
         env:
@@ -121,9 +104,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.bump.outputs.version }}
-          NOTES: ${{ steps.notes.outputs.path }}
         run: |
           gh release create "v${VERSION}" \
             --draft \
             --title "v${VERSION}" \
-            --notes-file "$NOTES"
+            --notes-file "$RUNNER_TEMP/notes.md"

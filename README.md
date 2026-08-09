@@ -61,7 +61,7 @@ uv run ty check                                              # type check
 
 CI runs the same checks — `ruff format --check`, `ruff check`, and `ty check`, then `pytest` — on every pull request and on pushes to `main`, via GitHub Actions on a `macos-latest` runner (Apple Silicon, so `mlx-lm` installs natively). The checks are non-mutating: `ruff format --check` verifies formatting instead of applying it, so unformatted code fails CI rather than being auto-fixed.
 
-Release history and notes are on the [Releases](https://github.com/darylalim/tiny-aya-translate/releases) page.
+Releases are automatic. Once the checks pass on `main`, a version bump in `pyproject.toml` is tagged and a GitHub Release is drafted from the conventional commits since the previous tag; the `Release` workflow in the Actions tab does the same thing starting from a `patch`/`minor`/`major` choice. Both stop at a **draft**, so nothing ships until it is reviewed and published. Release history and notes are on the [Releases](https://github.com/darylalim/tiny-aya-translate/releases) page.
 
 ## License
 
